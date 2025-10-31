@@ -1,0 +1,17 @@
+# requirements.txt
+
+# Core de Machine Learning e computação numérica
+torch==2.8.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+torchvision==0.23.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+numpy==1.26.4
+scikit-learn==1.7.2
+
+# Manipulação de dados
+pandas==2.3.2
+
+# Visualização de dados
+matplotlib==3.10.6
+
+# Utilitários
+tqdm==4.67.1
+requests==2.32.5
