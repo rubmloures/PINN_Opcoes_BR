@@ -56,7 +56,7 @@ TRAINING_CONFIG = {
     # Configuração para Learning Rate e Stopping
     'use_adaptive_weights': True, 
     'learning_rates': [1e-4, 1e-5, 1e-6], # Lista de LRs para cada fase
-    'epochs_per_phase': 5000,                 # TETO de segurança para épocas em uma fase
+    'epochs_per_phase': 2,                 # TETO de segurança para épocas em uma fase
     'patience': 1000,                     # Paciência para o Early Stopping por fase
     'min_delta': 1e-7,
 

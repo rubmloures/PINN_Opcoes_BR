@@ -29,41 +29,53 @@ class PINN_BlackScholes(nn.Module):
     def __init__(self, config: dict, data_stats: dict):
         super().__init__()
         self.config = config
-        self.stats = data_stats # Contém S_max, S_min, etc., para desnormalização
-        self.problem_type = config.get('problem_type', 'INVERSE')
+        self.stats = data_stats
+        self.problem_type = config.get('problem_type', 'INVERSE')  # 'INVERSE' ou 'FORWARD'
         self.architecture = config.get('architecture', 'PAYOFF_INSPIRED')
-        
-        input_size = self.config['input_size']
+
+        # tamanhos
+        input_size_full = self.config['input_size']            # ex: 5 (S,K,T,r,premium)
+        input_size_price = input_size_full - 1                 # ex: 4 (S,K,T,r)
         fourier_features = self.config['fourier_features']
         fourier_sigma = self.config['fourier_sigma']
-        
-        # Camada de Mapeamento de Fourier
-        self.fourier = nn.Linear(input_size, fourier_features)
-        nn.init.normal_(self.fourier.weight, mean=0, std=fourier_sigma)
-        self.fourier.weight.requires_grad = False # Congela os pesos para ser um mapeamento fixo
-
-        # Componente Raso (Shallow)
         shallow_layers = self.config['shallow_layers']
-        self.shallow = self._build_sequential([2 * fourier_features] + shallow_layers)
-
-        # Componente Profundo (Deep)
         deep_layers = self.config['deep_layers']
-        self.deep = self._build_sequential([2 * fourier_features] + deep_layers)
-        
-        # Camada Combinadora
+
+        # --- Map. Fourier separado para INVERSE (usa premium) e PRICE (sem premium) ---
+        # Fourier for INVERSE route (input_size_full)
+        self.fourier_full = nn.Linear(input_size_full, fourier_features)
+        nn.init.normal_(self.fourier_full.weight, mean=0, std=fourier_sigma)
+        self.fourier_full.weight.requires_grad = False  # mapeamento fixo
+
+        # Fourier for PRICE route (input_size_price)
+        self.fourier_price = nn.Linear(input_size_price, fourier_features)
+        nn.init.normal_(self.fourier_price.weight, mean=0, std=fourier_sigma)
+        self.fourier_price.weight.requires_grad = False
+
+        # --- Blocos Shallow / Deep separados para cada rota (claridade/independência) ---
+        self.shallow_inv = self._build_sequential([2 * fourier_features] + shallow_layers)
+        self.deep_inv    = self._build_sequential([2 * fourier_features] + deep_layers)
+
+        self.shallow_price = self._build_sequential([2 * fourier_features] + shallow_layers)
+        self.deep_price    = self._build_sequential([2 * fourier_features] + deep_layers)
+
+        # --- Camadas combinadoras separadas (inv / price) ---
         combiner_input_size = shallow_layers[-1] + deep_layers[-1]
-        self.combiner = nn.Linear(combiner_input_size, 256) # Camada intermediária antes da saída
-        # AdaptiveActivation para o combiner — criado no __init__ para garantir que seus
-        # parâmetros sejam registrados e movidos com o modelo para o dispositivo correto.
+        self.combiner_inv = nn.Linear(combiner_input_size, 256)
+        self.combiner_price = nn.Linear(combiner_input_size, 256)
+
+        # Adaptive activation (pode ser compartilhada)
         self._adaptive_combiner = AdaptiveActivation(self.config['activation_fn'])
-        
-        # Cabeças de Saída (Output Heads)
+
+        # --- Cabeças de saída ---
+        # Em ambos os modos price_head espera receber (combined_price_features concat sigma) -> 256 + 1
         if self.problem_type == 'INVERSE':
-            # Saída para o preço (usado na perda de dados) e para a volatilidade
-            self.price_head = nn.Linear(256, 1)
-            self.vol_head = nn.Linear(256, 1)
-        else: # FORWARD
-            self.price_head = nn.Linear(256, 1)
+            # inv: produz sigma (da rota que vê premium) e price (rota que NÃO vê premium)
+            self.vol_head = nn.Linear(256, 1)           # sigma a partir de combined_inv_features
+            self.price_head = nn.Linear(256 + 1, 1)     # recebe combined_price_features + sigma
+        else:  # FORWARD
+            # forward: volatilidade é input (col 5) e price_head usa combined_price_features + sigma_input
+            self.price_head = nn.Linear(256 + 1, 1)
 
     def _build_sequential(self, layer_dims):
         """Construtor auxiliar para criar blocos de camadas sequenciais."""
@@ -75,65 +87,71 @@ class PINN_BlackScholes(nn.Module):
 
     def forward(self, x: torch.Tensor) -> dict:
         """
-        Executa a passagem forward da rede.
-        
-        Args:
-            x (torch.Tensor): Tensor de entrada normalizado.
-        
-        Returns:
-            dict: Um dicionário contendo as saídas relevantes (preço, volatilidade).
+        Forward pass do PINN.
+        - x: tensor normalizado com 5 colunas (S_norm,K_norm,T_norm,r,premium) quando INVERSE.
+        - Retorna dicionário com 'price' e 'sigma'.
         """
-        # Desnormaliza as entradas para cálculos físicos
-        S_norm, K_norm, T_norm, r = x[:, 0:1], x[:, 1:2], x[:, 2:3], x[:, 3:4]
-        
+        # --- Slicing/Desnormalização básica ---
+        # x layout esperado: [S_norm, K_norm, T_norm, r, premium]   # 5: S,K,T,r,premium
+        S_norm = x[:, 0:1]
+        K_norm = x[:, 1:2]
+        T_norm = x[:, 2:3]
+        r      = x[:, 3:4]
+        # premium_col = x[:, 4:5]   # usado apenas na rota inverse (via fourier_full)
+
+        # Desnormaliza para cálculos físicos (para uso no payoff/intrinsic)
         S = S_norm * (self.stats['S_max'] - self.stats['S_min']) + self.stats['S_min']
         K = K_norm * (self.stats['K_max'] - self.stats['K_min']) + self.stats['K_min']
         T = T_norm * self.stats['T_max']
 
-        # Mapeamento de Fourier
-        x_fourier = torch.cat([
-            torch.sin(self.fourier(x)),
-            torch.cos(self.fourier(x))
-        ], dim=1)
+        # --- Rota INVERSE: usa o vetor completo (incl. premium) para estimar sigma ---
+        x_full = x  # S_norm, K_norm, T_norm, r, premium
+        x_fourier_full = torch.cat([torch.sin(self.fourier_full(x_full)), torch.cos(self.fourier_full(x_full))], dim=1)
+        shallow_out_inv = self.shallow_inv(x_fourier_full)
+        deep_out_inv    = self.deep_inv(x_fourier_full)
+        combined_inv = torch.cat([shallow_out_inv, deep_out_inv], dim=1)
+        combined_inv_features = self._adaptive_combiner(self.combiner_inv(combined_inv))
 
-        # Passagem pelos componentes Shallow e Deep
-        shallow_out = self.shallow(x_fourier)
-        deep_out = self.deep(x_fourier)
-
-        # Combinação e saída bruta
-        combined = torch.cat([shallow_out, deep_out], dim=1)
-        # usa a instância criada no __init__ (parâmetros já registrados e movidos com o modelo)
-        combined_features = self._adaptive_combiner(self.combiner(combined))
-        
-        outputs = {}
-
+        # Estima sigma apenas pela rota inverse (se aplicável)
+        sigma = None
         if self.problem_type == 'INVERSE':
-            # A rede aprende a volatilidade
-            # Usa softplus para garantir que a volatilidade seja sempre > 0
-            sigma = nn.functional.softplus(self.vol_head(combined_features))
-            outputs['sigma'] = sigma
-        else: # FORWARD
-            # A volatilidade é uma entrada (a 5ª coluna)
-            sigma = x[:, 4:5]
-            outputs['sigma'] = sigma
+            # softplus garante positividade de sigma
+            sigma = nn.functional.softplus(self.vol_head(combined_inv_features))
 
-        # Calcula o preço usando a arquitetura de saída escolhida
-        intrinsic_value = torch.relu(S - K)
-        
+        # --- Rota PRICE: NÃO usa premium (apenas S,K,T,r) ---
+        x_price = x[:, :4]  # S_norm, K_norm, T_norm, r  (sem premium)
+        x_fourier_price = torch.cat([torch.sin(self.fourier_price(x_price)), torch.cos(self.fourier_price(x_price))], dim=1)
+        shallow_out_price = self.shallow_price(x_fourier_price)
+        deep_out_price    = self.deep_price(x_fourier_price)
+        combined_price = torch.cat([shallow_out_price, deep_out_price], dim=1)
+        combined_price_features = self._adaptive_combiner(self.combiner_price(combined_price))
+
+        # --- Determinação de sigma em modo FORWARD (entra pela 5ª coluna em x) ---
+        if self.problem_type != 'INVERSE':
+            # FORWARD: sigma é fornecida como entrada (coluna 5)
+            sigma = x[:, 4:5]
+
+        # Assegure que sigma existe (deverá existir em ambos os modos)
+        if sigma is None:
+            raise RuntimeError("sigma não definido. Verifique problem_type e as entradas.")
+
+        # --- Preço a partir de combined_price_features + sigma (sem ver o premium original) ---
+        # concatenamos sigma (N x 1) com o embedding price (N x 256) -> (N x 257)
+        price_input = torch.cat([combined_price_features, sigma], dim=1)
+        price_raw = self.price_head(price_input)  # output shape (N,1)
+
+        # --- Saída: arquitetura PAYOFF_INSPIRED ou ORIGINAL ---
+        intrinsic_value = torch.relu(S - K)  # payoff no vencimento
         if self.architecture == 'PAYOFF_INSPIRED':
-            gating_factor = torch.sigmoid(self.price_head(combined_features))
+            gating_factor = torch.sigmoid(price_raw)  # 0..1
             price = (1 - gating_factor) * intrinsic_value + gating_factor * S
-        
         elif self.architecture == 'ORIGINAL':
             time_decay = 1 - torch.exp(-r * T)
-            # A constante 'A' pode ser um hiperparâmetro ou até mesmo aprendida
-            A = 2.0 
-            price_raw = self.price_head(combined_features)
+            A = 2.0
             price = intrinsic_value + time_decay * (S * A * torch.sigmoid(price_raw))
-        
         else:
-            raise ValueError("Arquitetura de modelo desconhecida especificada na configuração.")
+            raise ValueError("Arquitetura desconhecida na configuração.")
 
-        outputs['price'] = price
-        
+        # Saídas padronizadas
+        outputs = {'sigma': sigma, 'price': price}
         return outputs
