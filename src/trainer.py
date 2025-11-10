@@ -25,7 +25,7 @@ class PINNTrainer:
         self.model.to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters())
 
-        self.history = {'train_loss': [], 'val_loss': [], 'lr': [], 'weight_data': [], 'weight_pde': []}
+        self.history = {'train_loss': [], 'val_loss': [], 'lr': [], 'weight_data': [], 'weight_pde': [], 'weight_reg': []}        
         self.best_val_loss = float('inf')
         self.collocation_points_cache = None
 
@@ -33,7 +33,8 @@ class PINNTrainer:
         if self.use_adaptive_weights:
             self.log_lambda_data = torch.nn.Parameter(torch.zeros(1, device=self.device, requires_grad=True))
             self.log_lambda_pde = torch.nn.Parameter(torch.zeros(1, device=self.device, requires_grad=True))
-            self.optimizer.add_param_group({'params': [self.log_lambda_data, self.log_lambda_pde]})
+            self.log_lambda_reg = torch.nn.Parameter(torch.zeros(1, device=self.device, requires_grad=True))
+            self.optimizer.add_param_group({'params': [self.log_lambda_data, self.log_lambda_pde, self.log_lambda_reg]})
 
     def _resample_collocation_points(self, n_points: int, n_resample: int = 10000):
         """
@@ -42,7 +43,7 @@ class PINNTrainer:
         Observação: aqui NÃO usamos valores reais de premium — preenchimento com zero (dummy)
         para compatibilidade com a interface do modelo (5 colunas).
         """
-        print("    --> Reamostrando pontos de colocação por importância...")
+        #print("    --> Reamostrando pontos de colocação por importância...")
         self.model.eval()
 
         # input_price_size = 4 (S_norm, K_norm, T_norm, r)
@@ -104,6 +105,7 @@ class PINNTrainer:
         - loss_data: MSE entre price_pred e premium_real (supervisionado)
         - loss_boundary: condição de payoff no vencimento
         - loss_pde: MSE do resíduo PDE em collocation points (entrada sem premium real)
+        - loss_reg_sigma: Perda de suavidade da superfície sigma
         """
         inputs, premiums_real = batch_data
         inputs, premiums_real = inputs.to(self.device), premiums_real.to(self.device)
@@ -130,60 +132,93 @@ class PINNTrainer:
         price_pred_boundary = self.model(boundary_inputs)['price']
         loss_boundary = torch.nn.functional.mse_loss(price_pred_boundary, payoff_real)
 
-        # --- PDE loss ---
+        # --- PDE loss e REG loss (nos pontos de colocação) ---
         collocation_points = self._get_collocation_points(self.config['phy_batch_size'])
         output_phy = self.model(collocation_points)
+        
+        # Cálculo da Regularização de Suavidade do Sigma ---
+        sigma_phy = output_phy['sigma']
+        
+        # Calcula gradientes do sigma em relação às entradas (S, K, T, r, dummy)
+        # retain_graph=True é CRÍTICO, pois o cálculo do 'pde_res' logo abaixo
+        # também precisará usar o grafo computacional.
+        grad_sigma = torch.autograd.grad(
+            sigma_phy, collocation_points,
+            grad_outputs=torch.ones_like(sigma_phy),
+            create_graph=True,
+            retain_graph=True 
+        )[0]
+        
+        # Pegamos as derivadas em relação a S (idx 0), K (idx 1), e T (idx 2)
+        grad_sigma_S = grad_sigma[:, 0]
+        grad_sigma_K = grad_sigma[:, 1]
+        grad_sigma_T = grad_sigma[:, 2]
+        
+        # A perda é o MSE dessas derivadas (forçando-as a ser perto de zero, ou seja, "suave")
+        loss_reg_sigma = torch.mean(torch.square(grad_sigma_S)) + \
+                         torch.mean(torch.square(grad_sigma_K)) + \
+                         torch.mean(torch.square(grad_sigma_T))
+        # Cálculo da PDE Loss
         pde_res = black_scholes_residual(output_phy, collocation_points, self.data_stats)
         loss_pde = torch.nn.functional.mse_loss(pde_res, torch.zeros_like(pde_res))
     
         # --- Combina perdas ---
         if self.use_adaptive_weights:
+            loss_term_reg = (torch.exp(-self.log_lambda_reg) * loss_reg_sigma + self.log_lambda_reg)
             total_loss = (
                 (torch.exp(-self.log_lambda_data) * loss_data + self.log_lambda_data) +
                 (torch.exp(-self.log_lambda_pde) * loss_pde + self.log_lambda_pde) +
+                loss_term_reg + 
                 loss_boundary
             )
             return {
                 'total': total_loss,
                 'data': loss_data.item(),
                 'pde': loss_pde.item(),
+                'reg': loss_reg_sigma.item(), 
                 'data_weight': torch.exp(-self.log_lambda_data).item(),
-                'pde_weight': torch.exp(-self.log_lambda_pde).item()
+                'pde_weight': torch.exp(-self.log_lambda_pde).item(),
+                'reg_weight': torch.exp(-self.log_lambda_reg).item() 
             }
     
         else:
-            total_loss = (loss_data * data_weight) + (loss_pde * pde_weight) + loss_boundary
+            reg_weight = self.config.get('sigma_reg_weight', 0.01) 
+            total_loss = (
+                (loss_data * data_weight) + 
+                (loss_pde * pde_weight) + 
+                (loss_reg_sigma * reg_weight) + 
+                loss_boundary
+            )
             return {
                 'total': total_loss,
                 'data': loss_data.item(),
                 'pde': loss_pde.item(),
+                'reg': loss_reg_sigma.item(), 
                 'data_weight': data_weight,
-                'pde_weight': pde_weight
+                'pde_weight': pde_weight,
+                'reg_weight': reg_weight 
             }
 
     def train(self):
         print(f"Iniciando treinamento no dispositivo: {self.device}")
         total_start_time = time.time()
-
         # Hiperparâmetros principais
         learning_rates = self.config.get('learning_rates', [1e-4, 1e-5, 1e-6])
         epochs_per_phase = self.config.get('epochs_per_phase', self.config.get('max_epochs_per_phase', 5000))
         resample_every = self.config.get('resample_every', 25)
         total_epochs_done = 0
         training_completed = False
-        
         # Loop sobre diferentes fases de taxa de aprendizado
         for i, lr in enumerate(learning_rates):
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
-
             epochs_no_improve = 0
             # Criação da barra de progresso para a fase atual
             pbar = tqdm(range(epochs_per_phase),
                     desc=f"Fase {i+1}/{len(learning_rates)} (LR: {lr:.1e})",
-                    ncols=100,
                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [Tempo: {elapsed}<{remaining}] {postfix}'
                 )
+            
             for epoch_in_phase in range(epochs_per_phase):
                 # Reamostragem por importância periódica
                 if (total_epochs_done % resample_every) == 0:
@@ -200,6 +235,7 @@ class PINNTrainer:
                 total_loss_epoch = 0.0
                 total_loss_data = 0.0
                 total_loss_pde = 0.0
+                total_loss_reg = 0.0
                 n_batches = len(self.train_loader)
 
                 for batch_data in self.train_loader:
@@ -213,10 +249,12 @@ class PINNTrainer:
                     total_loss_epoch += losses['total'].item()
                     total_loss_data += losses['data']
                     total_loss_pde += losses['pde']
+                    total_loss_reg += losses['reg']
 
                 avg_loss_total = total_loss_epoch / n_batches
                 avg_loss_data = total_loss_data / n_batches
                 avg_loss_pde = total_loss_pde / n_batches
+                avg_loss_reg = total_loss_reg / n_batches
 
                 # Validação curta (apenas data loss)
                 self.model.eval()
@@ -234,25 +272,23 @@ class PINNTrainer:
                 self.history['train_loss'].append(avg_loss_total)
                 self.history['val_loss'].append(avg_val_loss)
                 self.history['lr'].append(lr)
+                
                 # Obtém pesos da fase (seja adaptativo ou curriculum)
-                if self.use_adaptive_weights:
-                    self.history['weight_data'].append(losses['data_weight'])
-                    self.history['weight_pde'].append(losses['pde_weight'])
-                else:
-                    self.history['weight_data'].append(data_weight)
-                    self.history['weight_pde'].append(pde_weight)
+                self.history['weight_data'].append(losses['data_weight'])
+                self.history['weight_pde'].append(losses['pde_weight'])
+                self.history['weight_reg'].append(losses['reg_weight'])
 
                 total_epochs_done += 1
 
                 # Atualiza barra de progresso com informações essenciais
-                pbar.set_postfix(
-                    Loss_Data=f"{avg_loss_data:.3e}", 
-                    Loss_PDE=f"{avg_loss_pde:.3e}", 
-                    Loss_Val=f"{avg_val_loss:.3e}", 
-                    Best_Val=f"{self.best_val_loss:.3e}"
+                postfix_str = (
+                    f"L_Data: {avg_loss_data:.2e}, "
+                    f"L_PDE: {avg_loss_pde:.2e}, "
+                    f"L_Reg: {avg_loss_reg:.2e} | "  # Separador
+                    f"L_Val: {avg_val_loss:.2e} (Best: {self.best_val_loss:.2e})"
                 )
+                pbar.set_postfix_str(postfix_str)
                 pbar.update(1)
-
                 # Early stopping / salvar melhor modelo
                 if avg_val_loss < self.best_val_loss - self.config['min_delta']:
                     self.best_val_loss = avg_val_loss

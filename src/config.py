@@ -68,6 +68,7 @@ TRAINING_CONFIG = {
     'initial_data_weight': 100.0,
     'final_pde_weight': 250.0,
     'final_data_weight': 10.0,
+    'sigma_reg_weight': 0.01,
 }
 
 # --- Configurações de Visualização ---

@@ -1,0 +1,15 @@
+*.csv
+*.csv
+dados/brutos/Databricks/ABEV3_2020.csv
+dados/brutos/Databricks/ABEV3_2021.csv
+dados/brutos/Databricks/ABEV3_2022.csv
+dados/brutos/Databricks/ABEV3_2023.csv
+dados/brutos/Databricks/ABEV3_2024.csv
+dados/brutos/Databricks/B3SA3_2020.csv
+dados/brutos/Databricks/BBAS3_2020.csv
+dados/brutos/Databricks/BBDC4_2020.csv
+dados/brutos/Databricks/ELET3_2020.csv
+dados/brutos/Databricks/ITUB4_2020.csv
+dados/brutos/Databricks/MGLU3_2020.csv
+dados/brutos/Databricks/PETR4_2020.csv
+dados/brutos/Databricks/VALE3_2020.csv
