@@ -1,317 +1,377 @@
 # /src/trainer.py
 
 import torch
+import torch.nn as nn
 import numpy as np
 import time
 import os
 from tqdm import tqdm
-import time
-
 from torch.utils.data import DataLoader
-from src.model import PINN_BlackScholes
-from src.physics import black_scholes_residual, payoff_boundary_condition
+from src.physics import heston_residual
 from src.config import TRAINING_CONFIG, PATHS
 from src.utils import salvar_historico_treinamento
+from src.logger import get_logger
+
+# Configurar logger
+logger = get_logger('PINN_Trainer')
 
 class PINNTrainer:
-    def __init__(self, model: PINN_BlackScholes, train_loader: DataLoader, val_loader: DataLoader, data_stats: dict, config: dict):
+    def __init__(self, model, train_loader: DataLoader, val_loader: DataLoader, data_stats: dict, config: dict):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.data_stats = data_stats
         self.config = config
-        self.device = torch.device(self.config['device'])
+        self.device = torch.device(self.config.get('device', 'cpu'))
 
         self.model.to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters())
-
-        self.history = {'train_loss': [], 'val_loss': [], 'lr': [], 'weight_data': [], 'weight_pde': [], 'weight_reg': []}        
+        
+        # Histórico expandido para diagnóstico
+        self.history = {
+            'train_loss': [], 
+            'val_loss': [],
+            'val_mae': [],
+            'lr': [], 
+            'loss_data': [], 
+            'loss_pde': [],
+            'loss_bc': [],
+            'loss_reg': [],
+            'weight_pde_curr': [],
+            'bias_pred': [],
+            'pde_data_ratio': [],
+            'sigma_data': [],
+            'sigma_pde': [],
+            'avg_pred_vol': [],
+            'avg_pred_price': [],
+            'avg_real_price': [],
+            'learned_bias': [],  # Novo: monitorar bias aprendível
+            'moneyness_preservation': []  # Novo: monitorar preservação de moneyness
+        }        
         self.best_val_loss = float('inf')
-        self.collocation_points_cache = None
 
+        # --- Pesos Adaptativos (Learnable Uncertainty) ---
         self.use_adaptive_weights = self.config.get('use_adaptive_weights', False)
         if self.use_adaptive_weights:
-            self.log_lambda_data = torch.nn.Parameter(torch.zeros(1, device=self.device, requires_grad=True))
-            self.log_lambda_pde = torch.nn.Parameter(torch.zeros(1, device=self.device, requires_grad=True))
-            self.log_lambda_reg = torch.nn.Parameter(torch.zeros(1, device=self.device, requires_grad=True))
-            self.optimizer.add_param_group({'params': [self.log_lambda_data, self.log_lambda_pde, self.log_lambda_reg]})
-
-    def _resample_collocation_points(self, n_points: int, n_resample: int = 10000):
-        """
-        Gera muitos pontos candidatos no espaço (S_norm,K_norm,T_norm,r), seleciona por importância
-        com base no resíduo PDE e mantém um cache dos melhores pontos.
-        Observação: aqui NÃO usamos valores reais de premium — preenchimento com zero (dummy)
-        para compatibilidade com a interface do modelo (5 colunas).
-        """
-        #print("    --> Reamostrando pontos de colocação por importância...")
-        self.model.eval()
-
-        # input_price_size = 4 (S_norm, K_norm, T_norm, r)
-        input_price_size = self.model.config['input_size'] - 1
-
-        # Gera candidatos no espaço de 4 variáveis (normalizado)
-        candidate_price = torch.rand(n_resample, input_price_size, device=self.device)
-        candidate_price.requires_grad = True
-
-        # Anexa coluna dummy de premium (zeros) para formar vetores de 5 colunas compatíveis
-        zeros_col = torch.zeros(n_resample, 1, device=self.device)
-        candidate_points = torch.cat([candidate_price, zeros_col], dim=1)
-        candidate_points = candidate_points.detach().clone().requires_grad_(True)
-
-        # Avalia resíduo PDE nesses candidatos
-        with torch.no_grad():
-            # Permite que o modelo calcule outputs; para cálculo do PDE sem grad interno aqui usamos o grafo depois
-            pass
-
-        # Precisamos de grad para o cálculo do resíduo (black_scholes_residual faz autograd)
-        candidate_points.requires_grad = True
-        output_phy = self.model(candidate_points)
-        pde_res = black_scholes_residual(output_phy, candidate_points, self.data_stats)
-        errors = torch.abs(pde_res).flatten().cpu().detach().numpy()
-
-        # Normaliza as probabilidades
-        if errors.sum() == 0:
-            probabilities = np.ones_like(errors) / errors.size
-        else:
-            probabilities = errors / errors.sum()
-
-        # Amostra índices com base nas probabilidades
-        chosen_indices = np.random.choice(n_resample, n_points, p=probabilities)
-
-        # Armazena cache (desanexado do grafo, mas com requires_grad True para próximo uso)
-        self.collocation_points_cache = candidate_points[chosen_indices].detach()
-        self.collocation_points_cache.requires_grad = True
-
-        self.model.train()
-
-    def _get_collocation_points(self, n_points: int) -> torch.Tensor:
-        """
-        Retorna pontos de colocação (com 5 colunas, última coluna premium dummy=0).
-        Se não houver cache, gera amostra uniforme no espaço de 4 variáveis e anexa a coluna dummy.
-        """
-        if self.collocation_points_cache is None:
-            input_price_size = self.model.config['input_size'] - 1
-            points_price = torch.rand(n_points, input_price_size, device=self.device)
-            zeros_col = torch.zeros(n_points, 1, device=self.device)
-            points = torch.cat([points_price, zeros_col], dim=1)
-            points.requires_grad = True
-            return points
-        else:
-            return self.collocation_points_cache
-
-    def _compute_train_losses(self, batch_data: tuple, pde_weight: float, data_weight: float) -> dict:
-        """
-        Calcula perdas:
-        - loss_data: MSE entre price_pred e premium_real (supervisionado)
-        - loss_boundary: condição de payoff no vencimento
-        - loss_pde: MSE do resíduo PDE em collocation points (entrada sem premium real)
-        - loss_reg_sigma: Perda de suavidade da superfície sigma
-        """
-        inputs, premiums_real = batch_data
-        inputs, premiums_real = inputs.to(self.device), premiums_real.to(self.device)
-
-        # Forward no modelo -> outputs contém 'price' e 'sigma'
-        model_output = self.model(inputs)
-        price_pred = model_output['price']
-        loss_data = torch.nn.functional.mse_loss(price_pred, premiums_real)
-
-        # --- Boundary loss: cria inputs de boundary com premium dummy zero ---
-        n_boundary = max(1, inputs.size(0) // 4)
-        s_boundary = torch.rand(n_boundary, 1, device=self.device)
-        k_boundary = torch.rand(n_boundary, 1, device=self.device)
-        t_boundary = torch.zeros(n_boundary, 1, device=self.device)  # t=0 (vencimento)
-        r_boundary = torch.rand(n_boundary, 1, device=self.device)
-        p_boundary = torch.zeros(n_boundary, 1, device=self.device)  # premium dummy (não mercado)
-        boundary_inputs = torch.cat([s_boundary, k_boundary, t_boundary, r_boundary, p_boundary], dim=1)
-
-        # Desnormaliza para payoff real
-        S_b = s_boundary * (self.data_stats['S_max'] - self.data_stats['S_min']) + self.data_stats['S_min']
-        K_b = k_boundary * (self.data_stats['K_max'] - self.data_stats['K_min']) + self.data_stats['K_min']
-        payoff_real = payoff_boundary_condition(S_b, K_b)
-
-        price_pred_boundary = self.model(boundary_inputs)['price']
-        loss_boundary = torch.nn.functional.mse_loss(price_pred_boundary, payoff_real)
-
-        # --- PDE loss e REG loss (nos pontos de colocação) ---
-        collocation_points = self._get_collocation_points(self.config['phy_batch_size'])
-        output_phy = self.model(collocation_points)
-        
-        # Cálculo da Regularização de Suavidade do Sigma ---
-        sigma_phy = output_phy['sigma']
-        
-        # Calcula gradientes do sigma em relação às entradas (S, K, T, r, dummy)
-        # retain_graph=True é CRÍTICO, pois o cálculo do 'pde_res' logo abaixo
-        # também precisará usar o grafo computacional.
-        grad_sigma = torch.autograd.grad(
-            sigma_phy, collocation_points,
-            grad_outputs=torch.ones_like(sigma_phy),
-            create_graph=True,
-            retain_graph=True 
-        )[0]
-        
-        # Pegamos as derivadas em relação a S (idx 0), K (idx 1), e T (idx 2)
-        grad_sigma_S = grad_sigma[:, 0]
-        grad_sigma_K = grad_sigma[:, 1]
-        grad_sigma_T = grad_sigma[:, 2]
-        
-        # A perda é o MSE dessas derivadas (forçando-as a ser perto de zero, ou seja, "suave")
-        loss_reg_sigma = torch.mean(torch.square(grad_sigma_S)) + \
-                         torch.mean(torch.square(grad_sigma_K)) + \
-                         torch.mean(torch.square(grad_sigma_T))
-        # Cálculo da PDE Loss
-        pde_res = black_scholes_residual(output_phy, collocation_points, self.data_stats)
-        loss_pde = torch.nn.functional.mse_loss(pde_res, torch.zeros_like(pde_res))
+            # Parâmetros treináveis: log(sigma^2) para Data e PDE
+            self.log_vars = nn.Parameter(torch.zeros(2, device=self.device, requires_grad=True))
     
-        # --- Combina perdas ---
+    def denormalize_price(self, y_normalized: torch.Tensor, K_real: torch.Tensor) -> torch.Tensor:
+        """
+        Desnormaliza preço: y_pred (normalizado por K) -> preço absoluto.
+        
+        Args:
+            y_normalized: Preço normalizado (y/K)
+            K_real: Strike price em escala real
+            
+        Returns:
+            Preço em escala absoluta (preço da opção em unidades monetárias)
+        """
+        # Fórmula: y_denorm = y_norm * K
+        # Garante dimensões compatíveis
+        if y_normalized.dim() > K_real.dim():
+            K_real = K_real.unsqueeze(-1)
+        
+        y_denorm = y_normalized * K_real
+        
+        # Garantir valores não-negativos (preços não podem ser negativos)
+        y_denorm = torch.clamp(y_denorm, min=0.0)
+        
+        return y_denorm
+    
+    def compute_loss(self, batch, weight_pde_curr):
+        """Calcula a perda composta (dados + física) com curriculum learning."""
+        # Desempacotar batch com validação
+        try:
+            if len(batch) == 6:
+                x_seq, x_phy, y_real, X_time, weights, asset_ids = batch
+            else:
+                raise ValueError(f"Batch esperado com 6 elementos, recebido {len(batch)}")
+        except Exception as e:
+            logger.error(f"Erro ao desempacotar batch: {e}")
+            raise
+        
+        x_seq = x_seq.to(self.device)
+        x_phy = x_phy.to(self.device)
+        y_real = y_real.to(self.device)
+        weights = weights.to(self.device)
+        
+        # ===== VALIDAÇÃO CRÍTICA: ASSET_IDS =====
+        if asset_ids is not None:
+            asset_ids = asset_ids.to(self.device)
+            if self.model.use_embedding and asset_ids.shape[0] != x_seq.shape[0]:
+                logger.warning(
+                    f"Mismatch dimensão asset_ids ({asset_ids.shape[0]}) vs "
+                    f"x_seq ({x_seq.shape[0]}). Ajustando..."
+                )
+                asset_ids = asset_ids[:x_seq.shape[0]]
+        else:
+            logger.debug("Asset IDs são None - usando modelo sem embeddings")
+            if self.model.use_embedding:
+                logger.warning("Modelo configurado para usar embeddings mas asset_ids é None")
+
+        # Habilita gradiente para física
+        x_phy.requires_grad_(True)
+        
+        # Forward Pass
+        outputs = self.model(x_seq, x_phy, asset_ids)  
+        pred_price = outputs['price']  # Preço normalizado (P/K)
+        
+        # 1. Loss de Dados (MSE Ponderado) - usa preços normalizados
+        loss_data = torch.mean(weights * (pred_price - y_real) ** 2)
+        weight_data = self.config['weight_data']
+        
+        # 2. Loss da PDE (Heston) - também usa preços normalizados
+        lambda_bc = self.config.get('lambda_bc', 1.0)
+        lambda_reg = self.config.get('lambda_reg', 0.01)
+        
+        physics_output = heston_residual(
+            outputs, 
+            x_phy, 
+            self.data_stats,
+            lambda_bc=lambda_bc,
+            lambda_reg=lambda_reg
+        )
+        
+        # Extrair componentes de physics (sempre retorna dicionário)
+        if not isinstance(physics_output, dict):
+            raise ValueError(
+                f"physics_output deve ser dict, recebido {type(physics_output)}. "
+                f"Verifique heston_residual() em src/physics.py"
+            )
+        
+        loss_pde_total = physics_output['total']
+        loss_pde = physics_output['pde']
+        loss_bc = physics_output.get('bc', torch.tensor(0.0, device=self.device))
+        loss_reg = physics_output.get('reg', torch.tensor(0.0, device=self.device))
+        
+        # 3. Regularização do Bias (evita que fique muito grande)
+        bias_reg = 0.01 * (self.model.price_bias ** 2)
+        
+        # 4. Combinação com Curriculum Learning
         if self.use_adaptive_weights:
-            loss_term_reg = (torch.exp(-self.log_lambda_reg) * loss_reg_sigma + self.log_lambda_reg)
-            total_loss = (
-                (torch.exp(-self.log_lambda_data) * loss_data + self.log_lambda_data) +
-                (torch.exp(-self.log_lambda_pde) * loss_pde + self.log_lambda_pde) +
-                loss_term_reg + 
-                loss_boundary
-            )
-            return {
-                'total': total_loss,
-                'data': loss_data.item(),
-                'pde': loss_pde.item(),
-                'reg': loss_reg_sigma.item(), 
-                'data_weight': torch.exp(-self.log_lambda_data).item(),
-                'pde_weight': torch.exp(-self.log_lambda_pde).item(),
-                'reg_weight': torch.exp(-self.log_lambda_reg).item() 
-            }
-    
+            # Pesos adaptativos (Kendall et al.)
+            precision_data = torch.exp(-self.log_vars[0])
+            precision_pde = torch.exp(-self.log_vars[1])
+            
+            total_loss = (precision_data * loss_data + self.log_vars[0]) + \
+                         (precision_pde * loss_pde_total + self.log_vars[1]) + bias_reg
         else:
-            reg_weight = self.config.get('sigma_reg_weight', 0.01) 
-            total_loss = (
-                (loss_data * data_weight) + 
-                (loss_pde * pde_weight) + 
-                (loss_reg_sigma * reg_weight) + 
-                loss_boundary
-            )
-            return {
-                'total': total_loss,
-                'data': loss_data.item(),
-                'pde': loss_pde.item(),
-                'reg': loss_reg_sigma.item(), 
-                'data_weight': data_weight,
-                'pde_weight': pde_weight,
-                'reg_weight': reg_weight 
-            }
+            # Pesos fixos com curriculum learning
+            weight_data = self.config.get('weight_data')
+            total_loss = weight_data * loss_data + weight_pde_curr * loss_pde_total + bias_reg
+
+        return total_loss, loss_data, loss_pde_total, outputs
 
     def train(self):
-        print(f"Iniciando treinamento no dispositivo: {self.device}")
+        logger.info(f"Iniciando Treinamento Híbrido no dispositivo: {self.device}")
         total_start_time = time.time()
-        # Hiperparâmetros principais
-        learning_rates = self.config.get('learning_rates', [1e-4, 1e-5, 1e-6])
-        epochs_per_phase = self.config.get('epochs_per_phase', self.config.get('max_epochs_per_phase', 5000))
-        resample_every = self.config.get('resample_every', 25)
-        total_epochs_done = 0
-        training_completed = False
-        # Loop sobre diferentes fases de taxa de aprendizado
-        for i, lr in enumerate(learning_rates):
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
-            epochs_no_improve = 0
-            # Criação da barra de progresso para a fase atual
-            pbar = tqdm(range(epochs_per_phase),
-                    desc=f"Fase {i+1}/{len(learning_rates)} (LR: {lr:.1e})",
-                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [Tempo: {elapsed}<{remaining}] {postfix}'
-                )
+        global_epoch = 0
+        
+        # Loop de Fases (Curriculum Learning)
+        learning_rates = self.config.get('learning_rates', [1e-3, 1e-4, 1e-5])
+        
+        for phase, lr in enumerate(learning_rates):
+            logger.info(f"Fase {phase+1}/{len(learning_rates)} | Learning Rate: {lr}")
             
-            for epoch_in_phase in range(epochs_per_phase):
-                # Reamostragem por importância periódica
-                if (total_epochs_done % resample_every) == 0:
-                    self._resample_collocation_points(self.config['phy_batch_size'])
-
-                epoch_start_time = time.time()
+            # Reinicializa otimizador para a nova fase
+            params = list(self.model.parameters())
+            if self.use_adaptive_weights:
+                params.append(self.log_vars)
+            
+            self.optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-3)
+            
+            # Reset de variáveis de Early Stopping
+            epochs_no_improve = 0
+            best_phase_loss = float('inf')
+            
+            pbar = tqdm(range(self.config.get('epochs_per_phase', 100)), desc=f"Fase {phase+1}")
+            
+            for epoch in pbar:
+                # Curriculum Learning
+                global_epoch += 1                
+                if global_epoch < self.config['warmup_epochs']:
+                    w_pde = 0.0
+                elif global_epoch < self.config['warmup_epochs'] + self.config['rampup_epochs']:
+                    progress = (global_epoch - self.config['warmup_epochs']) / self.config['rampup_epochs']
+                    w_pde = self.config['weight_pde'] * progress
+                else:
+                    w_pde = self.config['weight_pde']
+                    
                 self.model.train()
-
-                # pesos para curriculum (pde vs data) calculados externamente no loop
-                progress = total_epochs_done / (len(learning_rates) * epochs_per_phase) if (len(learning_rates) * epochs_per_phase) > 0 else 0
-                pde_weight = self.config['initial_pde_weight'] + progress * (self.config['final_pde_weight'] - self.config['initial_pde_weight'])
-                data_weight = self.config['initial_data_weight'] - progress * (self.config['initial_data_weight'] - self.config['final_data_weight'])
-
-                total_loss_epoch = 0.0
-                total_loss_data = 0.0
-                total_loss_pde = 0.0
-                total_loss_reg = 0.0
-                n_batches = len(self.train_loader)
-
-                for batch_data in self.train_loader:
-                    self.optimizer.zero_grad()
-                    # Calcula perdas (agora retorna um dict com valores .item())
-                    losses = self._compute_train_losses(batch_data, pde_weight, data_weight)
-                    # Backpropagation
-                    losses['total'].backward()
-                    self.optimizer.step()
-                    # Acumula perdas para a média da época
-                    total_loss_epoch += losses['total'].item()
-                    total_loss_data += losses['data']
-                    total_loss_pde += losses['pde']
-                    total_loss_reg += losses['reg']
-
-                avg_loss_total = total_loss_epoch / n_batches
-                avg_loss_data = total_loss_data / n_batches
-                avg_loss_pde = total_loss_pde / n_batches
-                avg_loss_reg = total_loss_reg / n_batches
-
-                # Validação curta (apenas data loss)
-                self.model.eval()
-                total_val_loss = 0.0
-                with torch.no_grad():
-                    for batch_data in self.val_loader:
-                        inputs, premiums_real = batch_data
-                        inputs, premiums_real = inputs.to(self.device), premiums_real.to(self.device)
-                        price_pred = self.model(inputs)['price']
-                        val_loss = torch.nn.functional.mse_loss(price_pred, premiums_real)
-                        total_val_loss += val_loss.item()
-                avg_val_loss = total_val_loss / max(1, len(self.val_loader))
-
-                 # Registro de histórico
-                self.history['train_loss'].append(avg_loss_total)
-                self.history['val_loss'].append(avg_val_loss)
-                self.history['lr'].append(lr)
+                train_loss_acc = 0
+                data_loss_acc = 0
+                pde_loss_acc = 0
                 
-                # Obtém pesos da fase (seja adaptativo ou curriculum)
-                self.history['weight_data'].append(losses['data_weight'])
-                self.history['weight_pde'].append(losses['pde_weight'])
-                self.history['weight_reg'].append(losses['reg_weight'])
+                # Acumuladores para métricas
+                pred_vol_acc = 0
+                pred_price_acc = 0
+                real_price_acc = 0
+                num_samples_epoch = 0
+                bc_loss_acc = 0
+                reg_loss_acc = 0
 
-                total_epochs_done += 1
+                # Loop de Batches
+                for batch in self.train_loader:
+                    self.optimizer.zero_grad()
+                    
+                    loss, l_data, l_pde, outputs = self.compute_loss(batch, w_pde)
+                    
+                    if torch.isnan(loss) or torch.isinf(loss) or l_pde > 1e6:
+                        # Pula batch corrompido
+                        continue
+                    
+                    loss.backward()
+                    
+                    # Clip gradiente para estabilidade
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    self.optimizer.step()
+                    
+                    train_loss_acc += loss.item()
+                    data_loss_acc += l_data.item()
+                    pde_loss_acc += l_pde.item()
+                    
+                    # Coleta métricas
+                    # CORRIGIDO: Verificação de 'heston_params' antes de acessar
+                    if 'heston_params' in outputs and outputs['heston_params'] is not None:
+                        nu = outputs['heston_params'][0]
+                        pred_vol = torch.sqrt(torch.clamp(nu, min=1e-6)).mean().item()
+                    else:
+                        pred_vol = 0.0  # Fallback se não houver parâmetros Heston
+                    
+                    pred_price = outputs['price'].mean().item()
+                    
+                    # y_real está no batch[2] (Normalizado P/K)
+                    y_real_batch = batch[2].to(self.device)
+                    x_phy_batch = batch[1].to(self.device)
+                    
+                    # Desnormaliza y_real para logar o preço real em R$ (apenas para métricas)
+                    K_norm_batch = x_phy_batch[:, 1:2]
+                    # CORRECTED: Usar Z-score desnormalização (consistente com data_loader)
+                    K_real_batch = K_norm_batch * self.data_stats['K_std'] + self.data_stats['K_mean']
+                    y_real_denorm = y_real_batch * K_real_batch
+                    
+                    real_price = y_real_denorm.mean().item()
+                    
+                    pred_vol_acc += pred_vol
+                    pred_price_acc += pred_price
+                    real_price_acc += real_price
+                    num_samples_epoch += 1
 
-                # Atualiza barra de progresso com informações essenciais
-                postfix_str = (
-                    f"L_Data: {avg_loss_data:.2e}, "
-                    f"L_PDE: {avg_loss_pde:.2e}, "
-                    f"L_Reg: {avg_loss_reg:.2e} | "  # Separador
-                    f"L_Val: {avg_val_loss:.2e} (Best: {self.best_val_loss:.2e})"
-                )
-                pbar.set_postfix_str(postfix_str)
-                pbar.update(1)
-                # Early stopping / salvar melhor modelo
-                if avg_val_loss < self.best_val_loss - self.config['min_delta']:
-                    self.best_val_loss = avg_val_loss
+                # Médias
+                avg_total = train_loss_acc / len(self.train_loader)
+                avg_data = data_loss_acc / len(self.train_loader)
+                avg_pde = pde_loss_acc / len(self.train_loader)
+
+                # Validação
+                val_mse, val_mae = self.validate()
+                
+                # Médias das métricas extras
+                avg_pred_vol = pred_vol_acc / num_samples_epoch if num_samples_epoch > 0 else 0
+                avg_pred_price = pred_price_acc / num_samples_epoch if num_samples_epoch > 0 else 0
+                avg_real_price = real_price_acc / num_samples_epoch if num_samples_epoch > 0 else 0
+                diff_pred = avg_pred_price - avg_real_price
+
+                # Atualiza histórico
+                self.history['train_loss'].append(avg_total)
+                self.history['val_loss'].append(val_mse)
+                self.history['weight_pde_curr'].append(w_pde)
+                self.history['loss_data'].append(avg_data)
+                self.history['loss_pde'].append(avg_pde)
+                self.history['lr'].append(lr)
+                self.history['avg_pred_vol'].append(avg_pred_vol)
+                self.history['avg_pred_price'].append(avg_pred_price)
+                self.history['avg_real_price'].append(avg_real_price)
+                self.history['val_mae'].append(val_mae)
+                self.history['bias_pred'].append(diff_pred)
+                
+                # Razão PDE/Data
+                pde_data_ratio = avg_pde / avg_data if avg_data > 0 else 0
+                self.history['pde_data_ratio'].append(pde_data_ratio)
+                
+                # Pesos adaptativos
+                if self.use_adaptive_weights:
+                    sigma_data = torch.exp(self.log_vars[0]).item()
+                    sigma_pde = torch.exp(self.log_vars[1]).item()
+                    self.history['sigma_data'].append(sigma_data)
+                    self.history['sigma_pde'].append(sigma_pde)
+                else:
+                    self.history['sigma_data'].append(None)
+                    self.history['sigma_pde'].append(None)
+                
+                # Monitorar bias aprendível
+                learned_bias = self.model.price_bias.item()
+                self.history['learned_bias'].append(learned_bias)
+                
+                # Monitorar preservação de moneyness (apenas informativo)
+                self.history['moneyness_preservation'].append(self.data_stats.get('moneyness_mean', 0.0))
+                
+                pbar.set_postfix({
+                    'L_Tot': f"{avg_total:.4f}",
+                    'L_Dat': f"{avg_data:.4e}",
+                    'L_PDE': f"{avg_pde:.4e}",
+                    'L_Val': f"{val_mse:.4e}",
+                    'MAE': f"{val_mae:.2f}", 
+                    'Bias': f"{diff_pred:+.2f}",
+                    'Bias_Param': f"{learned_bias:+.4f}"
+                })
+                
+                # Early Stopping
+                min_delta = self.config.get('min_delta', 1e-4)
+                patience = self.config.get('patience', 15)
+                
+                if val_mse < best_phase_loss - min_delta:
+                    best_phase_loss = val_mse
                     epochs_no_improve = 0
-                    os.makedirs(PATHS['model_save_dir'], exist_ok=True)
-                    torch.save(self.model.state_dict(), os.path.join(PATHS['model_save_dir'], 'best_model_weights.pth'))
+                    
+                    if val_mse < self.best_val_loss:
+                        self.best_val_loss = val_mse
+                        os.makedirs(PATHS.get('model_save_dir', 'resultados'), exist_ok=True)
+                        torch.save(self.model.state_dict(), 
+                                 os.path.join(PATHS.get('model_save_dir', 'resultados'), 'best_model_weights.pth'))
                 else:
                     epochs_no_improve += 1
 
-                if epochs_no_improve >= self.config['patience']:
-                    is_last_phase = (i == len(learning_rates) - 1)
-                    if is_last_phase:
-                        training_completed = True
+                if epochs_no_improve >= patience:
+                    logger.warning(f"Estagnação detectada na Fase {phase+1} (Epoch {epoch}). Avançando.")
                     break
             
-            pbar.close()  # Fecha barra da fase
-            if training_completed:
-                break
-
-        if not training_completed:
-            # finalização normal após todas as fases
-            pass
-
+            pbar.close()
+            
         total_time = (time.time() - total_start_time) / 60
-        print(f"\nTreinamento finalizado em {total_time:.2f} minutos.")
+        logger.info(f"Treinamento Completo Finalizado em {total_time:.2f} minutos.")
+        logger.info(f"Melhor Loss de Validação: {self.best_val_loss:.6f}")
+        
+        # Salva histórico final
         salvar_historico_treinamento(self.history)
+
+    def validate(self):
+        self.model.eval()
+        total_mse = 0
+        total_mae = 0
+        count = 0
+        
+        with torch.no_grad():
+            for batch in self.val_loader:
+                x_seq, x_phy, y_norm, _, weights, ids = batch
+                x_seq, x_phy, y_norm, ids = x_seq.to(self.device), x_phy.to(self.device), y_norm.to(self.device), ids.to(self.device)
+                
+                out = self.model(x_seq, x_phy, ids)
+                pred_norm = out['price']
+                
+                # Desnormalização para métricas reais (R$)
+                K_norm = x_phy[:, 1:2]
+                # CORRECTED: Usar Z-score desnormalização (consistente com data_loader)
+                K_real = K_norm * self.data_stats['K_std'] + self.data_stats['K_mean']
+                
+                pred_price = pred_norm * K_real
+                real_price = y_norm * K_real
+                
+                total_mse += torch.sum((pred_price - real_price)**2).item()
+                total_mae += torch.sum(torch.abs(pred_price - real_price)).item()
+                count += len(y_norm)
+                
+        mse = total_mse / count if count > 0 else 0
+        mae = total_mae / count if count > 0 else 0
+        
+        return mse, mae

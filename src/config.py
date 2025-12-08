@@ -10,76 +10,109 @@ RESULTS_DIR = os.path.join(BASE_DIR, 'resultados')
 
 PATHS = {
     'raw_data': os.path.join(DATA_DIR, 'brutos'),
-    'processed_data': os.path.join(DATA_DIR, 'processados', 'dados_unificados.csv'),
+    'dividend_data': os.path.join(DATA_DIR, 'brutos', 'dividend_yields.csv'), 
     'selic_data': os.path.join(DATA_DIR, 'brutos', 'taxa_selic.csv'),
+    'ibov_data': os.path.join(DATA_DIR, 'brutos', 'BOVA11.csv'),
     'model_save_dir': os.path.join(RESULTS_DIR, 'modelo_final'),
     'plot_save_dir': os.path.join(RESULTS_DIR, 'plots'),
-    'results_dir': RESULTS_DIR,            # Pasta raiz para resultados (onde o CSV será salvo)
+    'results_dir': RESULTS_DIR,
 }
 
-# --- Configurações de Pré-processamento de Dados ---
+# --- Configurações de Dados e Sequências ---
 DATA_CONFIG = {
-    'min_moneyness': 0.8,
-    'max_moneyness': 1.2,
-    'num_samples': 1_000_000,  # Amostragem para evitar sobrecarga de memória
+    'sequence_length': 30,      # Janela histórica (ex: 30 dias) para a LSTM
     'test_size': 0.2,
     'random_state': 42,
+    'num_samples': None,
+    # --- Ponderação ---
+    'use_sample_weights': True, # Ativa ponderação por moneyness
+    'min_moneyness': 0.7,       # Foco na região relevante
+    'max_moneyness': 1.3,
 }
 
-# --- Configurações da Arquitetura da Rede Neural ---
-# 'INVERSE': Aprende a volatilidade implícita (σ) a partir dos preços de mercado.
-# 'FORWARD': Precifica a opção com base na volatilidade (σ) fornecida.
-PROBLEM_TYPE = 'INVERSE' 
-# Para o projeto, a combinação mais poderosa e alinhada com os objetivos avançados é INVERSE + PAYOFF_INSPIRED
-
+# --- Configurações da Arquitetura Híbrida (DeepHeston) ---
 MODEL_CONFIG = {
-    'architecture': 'PAYOFF_INSPIRED',  # Opções: 'ORIGINAL', 'PAYOFF_INSPIRED'
-    'input_size': 5, # S, K, T, r, premium (para o problema inverso)
-    'fourier_features': 128,
-    'fourier_sigma': 5.0, # Controla a escala das features de Fourier
-    'shallow_layers': [256, 64], # Camadas do componente "raso"
-    'deep_layers': [256, 512, 512, 512, 512, 256], # Camadas do componente "profundo"
-    'activation_fn': torch.nn.GELU(),
-}
+    # Configs da LSTM (O Analista)
+    'lstm_input_size': 6,       # [log_ret, rolling_vol_20, ewma_vol, vol_parkinson, log_vol_fin, log_ret_ibov]
+    'lstm_hidden_size': 64,     # Tamanho do vetor de estado do mercado
+    'lstm_layers': 2,
+    'lstm_dropout': 0.2,
+    
+    # --- Asset Embeddings ---
+    'use_asset_embeddings': True,
+    'num_assets': 20,           # Tamanho do vocabulário (estimativa segura, ajustado dinamicamente no loader se quiser)
+    'asset_embedding_dim': 4,   # Dimensão do vetor latente por ativo
 
-# Se o problema for 'FORWARD', a entrada não inclui o prêmio
-if PROBLEM_TYPE == 'FORWARD':
-    MODEL_CONFIG['input_size'] = 5 # S, K, T, r, vol
+    # Configs da PINN (O Físico)
+    # Input: 5 (S,K,T,r,q) + 5 (Parâmetros Heston: nu, theta, kappa, xi, rho)   
+    # q = dividend yield
+    # Total input da rede densa = 10
+    'pinn_hidden_layers': 4,        # Camadas ocultas da PINN
+    'pinn_neurons': 64,             # Neurônios por camada oculta
+    'output_dim': 2,                # Preço e Volatilidade
+    'activation': 'tanh',           # SiLU (Swish) para melhor fluxo de gradiente
+    'dropout': 0.00,                # Dropout 
+
+    # Fourier Features
+    'use_fourier_features': True,   # Mapeamento para capturar altas frequências
+    'fourier_features': 128,        # Dimensão da projeção (gera 256 features: sin/cos)
+    'fourier_sigma': 1.0,           # Escala das frequências amostradas
+}
 
 # --- Configurações de Treinamento ---
 TRAINING_CONFIG = {
-    # Configuração do device e tamanho do batch
-    'device': 'cuda',                     # if torch.cuda.is_available() else 'cpu',
-    'batch_size': 8192,
-    'phy_batch_size': 8192,               # Batch size para os pontos de colocação da EDP
-
-    # Configuração para Learning Rate e Stopping
-    'use_adaptive_weights': True, 
-    'learning_rates': [1e-4, 1e-5, 1e-6], # Lista de LRs para cada fase
-    'epochs_per_phase': 2,                 # TETO de segurança para épocas em uma fase
-    'patience': 1000,                     # Paciência para o Early Stopping por fase
-    'min_delta': 1e-7,
-
-    # Amostragem por Importância
-    'resample_every': 25,           # A cada 50 épocas, reavalia e seleciona novos pontos de colocação
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    # Performance GPU
+    'batch_size': 4096,       # Alto para maximizar throughput da GPU
+    'phy_batch_size': 4096,   # Pontos de colocação da EDP
     
-    # Pesos do Curriculum Learning (ajustados dinamicamente por fase no trainer)
-    'initial_pde_weight': 10.0,
-    'initial_data_weight': 100.0,
-    'final_pde_weight': 250.0,
-    'final_data_weight': 10.0,
-    'sigma_reg_weight': 0.01,
+    # Pesos Adaptativos
+    'use_adaptive_weights': False,  # Ativado para balancear Data vs PDE dinamicamente
+    # Pesos Fixos Manuais (usados quando use_adaptive_weights=False)
+    'weight_data': 100.0,       # Peso da loss de dados (normalizada)
+    'weight_pde': 1.0,          # Peso da loss de física (CORRIGIDO: agora balanceado)
+    
+    # Curriculum
+    'warmup_epochs': 20,        # Épocas iniciais com peso físico ZERO (só aprende dados)
+    'rampup_epochs': 50,        # Épocas para subir o peso físico de 0 até o target
+    
+    # --- Curriculum Learning (Fases) ---
+    # Lista de LRs: começa alto para exploração, diminui para refinamento
+    'learning_rates': [1e-3, 1e-4, 1e-5, 1e-6], # Fases de LR decrescente 
+    'epochs_per_phase': 600,                    # Teto de épocas por fase 300
+    'patience': 100,                            # Paciência para acionar early stopping 50
+    'min_delta': 1e-7,                          # Exige melhora real para continuar
+    
+    # --- Fine-Tuning (Especialização por Ativo) ---
+    'finetune_epochs': 30,              # Épocas por ativo
+    'finetune_learning_rate': 1e-4,     # LR específico para fine-tune
+    'finetune_batch_size': 256,         # Batch menor para dados específicos do ativo
+    'finetune_patience': 10,            # Early stopping mais permissivo
+
+    # --- Pesos para Física Avançada (Literature-Based) ---
+    'lambda_bc': 1.0,         # Peso para boundary conditions (Heston 1993, Beck et al. 2019)
+    'lambda_reg': 0.01,       # Peso para regularização física dos parâmetros (Wang et al. 2020)
+    
+    # --- Amostragem por Importância ---
+    'resample_every': 50,      # A cada n épocas, gera novos pontos (S, t) para a PDE
 }
 
 # --- Configurações de Visualização ---
 VIZ_CONFIG = {
-    'plot_loss': True,
-    'plot_vol_surface': True,
-    'plot_pde_residual': True,
-    'plot_price_comparation': True,      
-    'plot_moneyness_comparation': True,  
-    'plot_greeks_comparation': True,     
-    'plot_price_surfaces': True,         
-    'plot_vol_smile': True,
-    'plot_weights_history': True,              
+    'plot_loss': True,                      # Histórico de Loss (Treino vs Validação)
+    'plot_weights_history': True,           # Evolução dos pesos (Data vs PDE)
+    'plot_premium_time': True,              # Série temporal (Real vs Previsto)
+    'plot_model_vs_bs': True,               # Scatter: Modelo vs Black-Scholes vs Real
+    'plot_heston_params': True,             # Histograma dos parâmetros estocásticos
+    'plot_price_scatter': True,             # Scatter: Real vs Previsto (com R²)
+    'plot_dist_overlay': True,              # Histograma comparativo de distribuições
+    'plot_residuals': True,                 # Resíduos vs Moneyness
+    'plot_error_by_moneyness': True,        # Barplot de MAE por região
+    'plot_error_heatmap': True,             # Mapa de calor 2D do erro (S vs T)
+    'plot_price_surface': True,             # Superfície 3D de Preço
+    'plot_delta_surface': True,             # Superfície 3D do Delta
+    'plot_pde_residual': True,              # Superfície 3D do Resíduo da Física
+    'plot_vol_smile': True,                 # Volatilidade Implícita vs Moneyness
+    'plot_latent_vol': True,                # Evolução da volatilidade (nu)
+    'plot_premium_by_moneyness_time': True, # Heatmap do prêmio por moneyness ao longo do tempo
 }

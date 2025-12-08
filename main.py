@@ -2,125 +2,142 @@
 
 import os
 import torch
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from torch.utils.data import TensorDataset, DataLoader
 import json
-# Importa as configurações e os módulos que criamos
+import numpy as np
+import pandas as pd
+from torch.utils.data import DataLoader, random_split
+
+# Importa as configurações e módulos
 from src.config import PATHS, DATA_CONFIG, MODEL_CONFIG, TRAINING_CONFIG, VIZ_CONFIG
-from src.data_loader import carregar_taxa_juros, carregar_e_processar_dados_opcoes
-from src.model import PINN_BlackScholes
+from src.data_loader import carregar_taxa_juros, criar_dataset_hibrido
+from src.model import DeepHestonHybrid
 from src.trainer import PINNTrainer
 from src.visualization import Visualizer
+from src.logger import setup_logger
+from src.fine_tune import FineTuner
+
 
 def run_pipeline():
-    """
-    Função principal que executa todo o pipeline do projeto.
-    """
-    # --- 1. Carregamento e Preparação dos Dados ---
-    print("Iniciando pipeline: Fase 1 - Carregamento de Dados")
+    # Configurar logger principal com arquivo de log
+    logger = setup_logger(
+        name='PINN_Main',
+        log_dir=PATHS.get('results_dir', 'resultados'),
+        level=20  # INFO
+    ) 
+    logger.info("Iniciando Pipeline Heston-LSTM Híbrido")
+    
+    # --- 1. Preparação dos Dados ---
+    logger.info("[Fase 1] Carregando dados e gerando sequências temporais...")
     df_juros = carregar_taxa_juros(PATHS['selic_data'])
     if df_juros is None:
-        return # Encerra se não conseguir carregar os juros
-
-    df_opcoes = carregar_e_processar_dados_opcoes(PATHS['raw_data'], df_juros)
-    if df_opcoes.empty:
-        print("Pipeline encerrado: Nenhum dado de opção para processar.")
+        logger.error("Falha ao carregar taxa de juros.")
         return
 
-    # --- 2. Normalização e Preparação dos Tensores ---
-    print("\nFase 2 - Preparando dados para o PyTorch")
+    # O novo loader faz todo o trabalho pesado: sliding windows + normalização
+    full_dataset, data_stats = criar_dataset_hibrido(
+        caminho_pasta_opcoes=PATHS['raw_data'],
+        df_juros=df_juros,
+        seq_length=DATA_CONFIG['sequence_length']
+    )
     
-    # Amostragem para limitar o uso de memória, se configurado
-    if len(df_opcoes) > DATA_CONFIG['num_samples']:
-        print(f"Realizando amostragem de {DATA_CONFIG['num_samples']} amostras...")
-        df_opcoes = df_opcoes.sample(n=DATA_CONFIG['num_samples'], random_state=DATA_CONFIG['random_state'])
+    if full_dataset is None:
+        logger.error("Nenhum dado encontrado ou processado.")
+        return
+    
+    # ===== CORREÇÃO 5: EXTRAIR NÚMERO REAL DE ATIVOS =====
+    num_assets_detected = len(data_stats.get('asset_map', {}))
+    logger.info(f"Ativos detectados no dataset: {num_assets_detected}")
+    
+    if num_assets_detected > 0:
+        # Atualizar MODEL_CONFIG dinamicamente
+        MODEL_CONFIG['num_assets'] = max(num_assets_detected, 10)  # Mínimo de segurança
+        logger.info(f"MODEL_CONFIG['num_assets'] atualizado para: {MODEL_CONFIG['num_assets']}")
         
-    # Guardar estatísticas para desnormalização dentro do modelo
-    data_stats = {
-        'S_min': df_opcoes['spot_price'].min(), 'S_max': df_opcoes['spot_price'].max(),
-        'K_min': df_opcoes['strike'].min(), 'K_max': df_opcoes['strike'].max(),
-        'T_max': df_opcoes['time_to_maturity'].max(),
-    }
+        # Log dos ativos encontrados
+        if 'asset_names' in data_stats:
+            logger.info(f"Ativos: {', '.join(data_stats['asset_names'])}")
+    else:
+        logger.warning("Nenhum ativo detectado! Usando configuração padrão.")
+
+    # Salva as estatísticas para inferência futura
+    os.makedirs(PATHS['model_save_dir'], exist_ok=True)
     stats_path = os.path.join(PATHS['model_save_dir'], 'data_stats.json')
     with open(stats_path, 'w') as f:
         json.dump(data_stats, f, indent=4)
-    print(f"Estatísticas de normalização salvas em: {stats_path}")
-    
-    # Normalização das features de entrada
-    df_opcoes['S_norm'] = (df_opcoes['spot_price'] - data_stats['S_min']) / (data_stats['S_max'] - data_stats['S_min'])
-    df_opcoes['K_norm'] = (df_opcoes['strike'] - data_stats['K_min']) / (data_stats['K_max'] - data_stats['K_min'])
-    df_opcoes['T_norm'] = df_opcoes['time_to_maturity'] / data_stats['T_max']
-    
-    # Amostragem estratificada baseada em 'moneyness'
-    print("Criando categorias de 'moneyness' para amostragem estratificada...")
-    # 1. Define os limites para cada categoria
-    # OTM: < 0.95, ATM: 0.95 a 1.05, ITM: > 1.05
-    bins = [0, 0.95, 1.05, np.inf]
-    labels = ['OTM', 'ATM', 'ITM']
-    # 2. Cria a nova coluna categórica no DataFrame
-    df_opcoes['moneyness_category'] = pd.cut(df_opcoes['moneyness'], bins=bins, labels=labels)
+    logger.info(f"Estatísticas salvas em: {stats_path}")
 
-    print("Distribuição das categorias:")
-    print(df_opcoes['moneyness_category'].value_counts(normalize=True))
-
-    # Define as colunas de entrada para o tensor
-    # Para o problema INVERSO, o prêmio é uma das entradas
-    input_features = ['S_norm', 'K_norm', 'T_norm', 'r', 'premium']
+    # Divisão Treino / Validação
+    total_size = len(full_dataset)
+    val_size = int(total_size * DATA_CONFIG['test_size'])
+    train_size = total_size - val_size
     
-    X = df_opcoes[input_features].values
-    y = df_opcoes[['premium']].values # O alvo da perda de dados ainda é o prêmio
+    # Generator com seed fixa para reprodutibilidade
+    generator = torch.Generator().manual_seed(DATA_CONFIG['random_state'])
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
     
-    # Armazena a coluna de estratificação
-    stratify_col = df_opcoes['moneyness_category']
-
-    # Divisão em treino e validação
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, 
-        test_size=DATA_CONFIG['test_size'], 
-        random_state=DATA_CONFIG['random_state'],
-        stratify=stratify_col  
-    )
-
-    # Criação dos DataLoaders do PyTorch
-    train_dataset = TensorDataset(torch.from_numpy(X_train).float(), torch.from_numpy(y_train).float())
-    val_dataset = TensorDataset(torch.from_numpy(X_val).float(), torch.from_numpy(y_val).float())
+    # Otimização de DataLoader: num_workers > 0 usa multiprocessamento para carregar dados
+    # pin_memory=True acelera transferência para GPU
+    train_loader = DataLoader(train_dataset, 
+                              batch_size=TRAINING_CONFIG['batch_size'], 
+                              shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, 
+                            batch_size=TRAINING_CONFIG['batch_size'], 
+                            shuffle=False, num_workers=4, pin_memory=True)
     
-    train_loader = DataLoader(train_dataset, batch_size=TRAINING_CONFIG['batch_size'], shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=TRAINING_CONFIG['batch_size'], shuffle=False, num_workers=0)
+    logger.info(f"Datasets prontos: Treino ({len(train_dataset)}) | Validação ({len(val_dataset)})")
 
-    print(f"Dados prontos: {len(train_dataset)} amostras de treino, {len(val_dataset)} amostras de validação.")
-
-    # --- 3. Instanciação e Treinamento do Modelo ---
-    print("\nFase 3 - Configurando e iniciando o treinamento do modelo")
+    # --- 2. Instanciação do Modelo ---
+    logger.info("[Fase 2] Inicializando DeepHestonHybrid...")
+    model = DeepHestonHybrid(config=MODEL_CONFIG, data_stats=data_stats)
     
-    pinn_model = PINN_BlackScholes(config=MODEL_CONFIG, data_stats=data_stats)
-    
+    # --- 3. Treinamento ---
+    logger.info("[Fase 3] Iniciando Treinamento...")
     trainer = PINNTrainer(
-        model=pinn_model,
+        model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         data_stats=data_stats,
         config=TRAINING_CONFIG
     )
     
+    # Executa o treino e salva o histórico
     trainer.train()
+    
+    # --- 4. Fine-Tuning Automático ---
+    logger.info("[Fase 4] Iniciando Especialização por Ativo...")
+    
+    # Recarrega o melhor modelo base
+    model.load_state_dict(torch.load(os.path.join(PATHS['model_save_dir'], 'best_model_weights.pth')))
+    # Instancia o Tuner usando o dataset completo que já está na memória (eficiência!)
+    tuner = FineTuner(model, full_dataset, data_stats, TRAINING_CONFIG, PATHS)
+    # Roda para todos
+    tuner.fine_tune_all(epochs=5, 
+                        lr=1e-5
+                    )
 
-    # --- 4. Visualização dos Resultados (a ser implementado) ---
-    print("\nFase 4 - Gerando visualizações dos resultados")
-    # 1. Caminho para o arquivo de histórico.
+    # --- 5. Visualização e Diagnóstico ---
+    logger.info("[Fase 5] Gerando Diagnósticos Visuais...")
+    
+    # O trainer salva o histórico em results_dir/training_history.csv, vamos garantir que usamos esse caminho
     history_file_path = os.path.join(PATHS['results_dir'], 'training_history.csv')
-    # 2. Instancia do Visualizer 
+    
+    # Verifica se o histórico foi criado antes de tentar plotar
+    if not os.path.exists(history_file_path):
+        logger.warning(f"Arquivo de histórico não encontrado em {history_file_path}. Plots de Loss serão ignorados.")
+    
     viz = Visualizer(
-        model=pinn_model, 
-        history_path=history_file_path, 
+        model=model,
+        history_path=history_file_path,
         val_loader=val_loader,
-        data_stats=data_stats, 
+        data_stats=data_stats,
         config=VIZ_CONFIG
-    ) 
+    )
+    
     viz.plot_all()
-    print("Plots salvos em:", PATHS['plot_save_dir'])
+    
+    logger.info("Pipeline Finalizado com Sucesso")
+    logger.info(f"Modelo salvo em: {PATHS['model_save_dir']}")
+    logger.info(f"Plots salvos em: {PATHS['plot_save_dir']}")
 
 if __name__ == '__main__':
     run_pipeline()

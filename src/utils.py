@@ -3,27 +3,50 @@
 import pandas as pd
 import os
 from src.config import PATHS
+from src.logger import get_logger
 
-def salvar_historico_treinamento(history: dict, nome_arquivo: str = "training_history.csv"):
+# Configurar logger
+logger = get_logger('PINN_Utils')
+
+def salvar_historico_treinamento(history: dict, results_dir: str = None):
     """
-    Salva o dicionário de histórico de treinamento em um arquivo CSV.
-
+    Salva o histórico de treinamento em CSV de forma segura,
+    lidando com listas de tamanhos diferentes.
+    
     Args:
-        history (dict): Dicionário contendo as listas de perdas.
-        nome_arquivo (str): Nome do arquivo CSV de saída.
+        history: Dicionário com histórico de treinamento
+        results_dir: Diretório para salvar (opcional, usa PATHS['results_dir'] se não informado)
     """
     try:
-        df_history = pd.DataFrame(history)
+        if results_dir is None:
+            results_dir = PATHS['results_dir']
+        os.makedirs(results_dir, exist_ok=True)
+        save_path = os.path.join(results_dir, 'training_history.csv')
         
-        # Garante que o diretório de resultados exista
-        os.makedirs(PATHS['results_dir'], exist_ok=True)
+        # Encontra o comprimento máximo entre as listas
+        max_len = max(len(v) for v in history.values() if isinstance(v, list))
         
-        caminho_completo = os.path.join(PATHS['results_dir'], nome_arquivo)
+        # Normaliza as listas (preenche com NaN se faltar dado no final)
+        history_normalized = {}
+        for k, v in history.items():
+            if isinstance(v, list):
+                if len(v) < max_len:
+                    # Estende com None/NaN
+                    v = v + [None] * (max_len - len(v))
+                history_normalized[k] = v
         
-        df_history.to_csv(caminho_completo, index_label='epoch')
-        print(f"Histórico de treinamento salvo com sucesso em: {caminho_completo}")
+        df = pd.DataFrame(history_normalized)
+        df.to_csv(save_path, index=False)
+        logger.info(f"Histórico salvo com sucesso em: {save_path}")
+        
     except Exception as e:
-        print(f"Erro ao salvar o histórico de treinamento: {e}")
+        logger.error(f"Erro crítico ao salvar histórico: {e}")
+        # Tenta salvar backup cru
+        try:
+            pd.DataFrame.from_dict(history, orient='index').transpose().to_csv(save_path + ".bak")
+            logger.info("Backup salvo.")
+        except:
+            pass
 
 # Adicione aqui sua função send_telegram_message se desejar usá-la
 # Exemplo:
