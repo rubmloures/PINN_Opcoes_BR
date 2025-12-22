@@ -194,7 +194,7 @@ def preparar_dados_lstm(caminho_pasta: str, df_selic: pd.DataFrame, sequence_len
         torch.from_numpy(y_normalized),
         torch.from_numpy(X_time),
         torch.from_numpy(weights),
-        torch.from_numpy(X_asset)  # Novo: asset_ids
+        torch.from_numpy(X_asset)  # Elemento 5: Asset ID
     )
 
     return dataset, data_stats

@@ -69,8 +69,8 @@ TRAINING_CONFIG = {
     # Pesos Adaptativos
     'use_adaptive_weights': False,  # Ativado para balancear Data vs PDE dinamicamente
     # Pesos Fixos Manuais (usados quando use_adaptive_weights=False)
-    'weight_data': 100.0,       # Peso da loss de dados (normalizada)
-    'weight_pde': 1.0,          # Peso da loss de física (CORRIGIDO: agora balanceado)
+    'weight_data': 1.0,          # Peso da loss de dados (normalizada)
+    'weight_pde': 0.1,          # Peso da loss de física 
     
     # Curriculum
     'warmup_epochs': 20,        # Épocas iniciais com peso físico ZERO (só aprende dados)
@@ -78,13 +78,13 @@ TRAINING_CONFIG = {
     
     # --- Curriculum Learning (Fases) ---
     # Lista de LRs: começa alto para exploração, diminui para refinamento
-    'learning_rates': [1e-3, 1e-4, 1e-5, 1e-6], # Fases de LR decrescente 
-    'epochs_per_phase': 600,                    # Teto de épocas por fase 300
-    'patience': 100,                            # Paciência para acionar early stopping 50
+    'learning_rates': [1e-4, 5e-5, 1e-5, 1e-6], # Fases de LR decrescente 
+    'epochs_per_phase': 2,                    # Teto de épocas por fase 300
+    'patience': 2,                            # Paciência para acionar early stopping 50
     'min_delta': 1e-7,                          # Exige melhora real para continuar
     
     # --- Fine-Tuning (Especialização por Ativo) ---
-    'finetune_epochs': 30,              # Épocas por ativo
+    'finetune_epochs': 2,              # Épocas por ativo
     'finetune_learning_rate': 1e-4,     # LR específico para fine-tune
     'finetune_batch_size': 256,         # Batch menor para dados específicos do ativo
     'finetune_patience': 10,            # Early stopping mais permissivo

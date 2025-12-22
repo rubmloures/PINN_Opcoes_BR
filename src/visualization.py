@@ -1,5 +1,18 @@
 # /src/visualization.py
 
+# /src/visualization.py
+
+"""
+Módulo de Visualização e Diagnóstico Financeiro (PINN Heston).
+
+Este módulo é responsável por gerar todos os artefatos visuais necessários para:
+1. Validar a convergência matemática do treinamento (Losses).
+2. Avaliar a aderência financeira do modelo (Preço de Mercado vs Modelo).
+3. Interpretar a "caixa preta" da rede neural (Volatilidade Latente, Superfícies).
+
+Padrão de Estilo: Seaborn/Matplotlib otimizado para relatórios financeiros.
+"""
+
 import torch
 import numpy as np
 import pandas as pd
@@ -10,35 +23,60 @@ import seaborn as sns
 from scipy.stats import norm
 from sklearn.metrics import r2_score
 
-from src.model import DeepHestonHybrid
 from src.physics import heston_residual
 from src.config import VIZ_CONFIG, PATHS
 from src.logger import get_logger
 
-# Configurar logger
+# Configurar logger exclusivo para o módulo visual
 logger = get_logger('PINN_Visualization')
 
-# Estilo profissional para publicações financeiras
+# --- Configuração Global de Estilo ---
+# Define um estilo limpo e profissional, ideal para papers ou dashboards.
 plt.style.use('seaborn-v0_8-paper')
 plt.rcParams.update({
     'font.size': 10, 
     'axes.titlesize': 12, 
     'axes.labelsize': 10, 
-    'figure.dpi': 150,
-    'savefig.bbox': 'tight'
+    'figure.dpi': 150,      # Alta resolução para exportação
+    'savefig.bbox': 'tight' # Evita cortes nas legendas ao salvar
 })
 
+# ==============================================================================
+# SEÇÃO 1: Funções Utilitárias Financeiras
+# ==============================================================================
+
 def black_scholes_price(S, K, T, r, sigma, option_type='call'):
-    """Cálculo analítico exato de Black-Scholes."""
+    """
+    Calcula o preço teórico de uma opção Europeia via Black-Scholes-Merton.
+    Usado aqui apenas como 'Baseline' para comparação de erro.
+
+    Args:
+        S (float/array): Preço Spot do ativo.
+        K (float/array): Preço de Exercício (Strike).
+        T (float/array): Tempo até o vencimento (em anos).
+        r (float/array): Taxa livre de risco anualizada.
+        sigma (float/array): Volatilidade implícita ou histórica.
+        option_type (str): 'call' ou 'put'.
+
+    Returns:
+        np.array: Preço teórico da opção.
+    """
+    # Proteção numérica para evitar divisão por zero ou log(0)
     S = np.maximum(S, 1e-5)
     K = np.maximum(K, 1e-5)
     T = np.maximum(T, 1e-5)
     sigma = np.maximum(sigma, 1e-5)
     
+    # Cálculo das probabilidades d1 e d2
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
     
-    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    if option_type.lower() == 'call':
+        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        
+    return price
 
 def bs_implied_vol_approx(S, K, T, r, price):
     """Aproximação Brenner & Subrahmanyam para Vol Implícita."""
@@ -47,22 +85,48 @@ def bs_implied_vol_approx(S, K, T, r, price):
     price = np.maximum(price, 1e-5)
     return np.sqrt(2 * np.pi / T.flatten()) * (price.flatten() / S.flatten())
 
+# ==============================================================================
+# SEÇÃO 2: Classe Visualizer (Motor de Plotagem)
+# ==============================================================================
 class Visualizer:
-    def __init__(self, model: DeepHestonHybrid, history_path: str, val_loader, data_stats: dict, config: dict):
+    """
+    Gerenciador central de visualizações do Pipeline.
+    Recebe o modelo treinado e os dados de validação para gerar relatórios.
+    """
+
+    def __init__(self, model, history_path, val_loader, data_stats, config):
+        """
+        Inicializa o visualizador com o contexto necessário.
+
+        Args:
+            model (nn.Module): O modelo híbrido (LSTM+PINN) já treinado.
+            history_path (str): Caminho para o CSV com o log de perdas (Losses).
+            val_loader (DataLoader): Dados de validação para inferência (Backtest).
+            data_stats (dict): Estatísticas de normalização (Mean/Std) para desnormalizar plots.
+            config (dict): Dicionário VIZ_CONFIG controlando quais plots gerar.
+        """
         self.model = model
         self.history_path = history_path
         self.val_loader = val_loader
         self.data_stats = data_stats
         self.config = config
-        self.device = next(model.parameters()).device
-        self.preds_cache = None
+        self.device = next(model.parameters()).device # Detecta device do modelo
+        
+        # Cria diretório de salvamento se não existir
+        os.makedirs(PATHS['plot_save_dir'], exist_ok=True)
         
         # Diretório de salvamento
         self.save_dir = self.config.get('plot_save_dir', PATHS['plot_save_dir'])
         os.makedirs(self.save_dir, exist_ok=True)
 
+        # Cache para inferência (evita reprocessar forward pass múltiplos vezes)
+        self.preds_cache = None
+
     def _run_inference(self):
-        """Roda inferência em todo o dataset de validação e faz cache dos resultados."""
+        """
+        Roda inferência em todo o dataset de validação e faz cache dos resultados.
+        Essencial para performance, evitando múltiplos loops no DataLoader.
+        """        
         if self.preds_cache is not None: return self.preds_cache
 
         self.model.eval()
@@ -97,7 +161,10 @@ class Visualizer:
         return self.preds_cache
 
     def _generate_synthetic_grid(self, n_points=40):
-        """Gera grid (S, T) sintético para plots de superfície e derivadas."""
+        """
+        Gera grid (S, T) sintético para plots de superfície e derivadas.
+        Permite visualizar a 'suavidade' da solução aprendida pela PINN.
+        """
         # Pega uma amostra real para gerar o estado inicial da LSTM
         try:
             sample_batch = next(iter(self.val_loader))
@@ -109,7 +176,7 @@ class Visualizer:
         asset_ids_sample = sample_batch[5].to(self.device)
         
         with torch.no_grad():
-            # CORREÇÃO: Preparar input da LSTM com embeddings
+            #Preparar input da LSTM com embeddings
             if self.model.use_embedding:
                 # [Batch, Emb_Dim]
                 emb = self.model.asset_embedding(asset_ids_sample)
@@ -133,27 +200,28 @@ class Visualizer:
         t_vals = np.linspace(0.1, 1.0, n_points) # Time range (anos)
         S_grid, T_grid = np.meshgrid(s_vals, t_vals)
         
-        # Converte para tensores [N*N, 1]
+        # Converte para tensores [N*N, 1] - garantindo device correto
         S_flat = torch.tensor(S_grid.flatten(), dtype=torch.float32, device=self.device).unsqueeze(1)
         T_flat = torch.tensor(T_grid.flatten(), dtype=torch.float32, device=self.device).unsqueeze(1)
-        K_flat = torch.ones_like(S_flat) * 1.0   # Strike normalizado
-        r_flat = torch.ones_like(S_flat) * 0.10  # Juros fixos 10%
-        q_flat = torch.ones_like(S_flat) * 0.02  # Dividend yield fixo 2%
+        K_flat = torch.ones_like(S_flat, device=self.device) * 1.0   # Strike normalizado
+        r_flat = torch.ones_like(S_flat, device=self.device) * 0.10  # Juros fixos 10%
+        q_flat = torch.ones_like(S_flat, device=self.device) * 0.02  # Dividend yield fixo 2%
         
-        # Input físico: [S, K, T, r, q]
-        x_phy_synthetic = torch.cat([S_flat, K_flat, T_flat, r_flat, q_flat], dim=1).requires_grad_(True)        
+        # Input físico: [S, K, T, r, q] - forçar device explicitamente
+        x_phy_synthetic = torch.cat([S_flat, K_flat, T_flat, r_flat, q_flat], dim=1).to(self.device).requires_grad_(True)        
         
         # Asset ID Fictício (Usa 0 como padrão para o plot genérico)
         asset_ids_synthetic = torch.zeros(x_phy_synthetic.shape[0], dtype=torch.long, device=self.device)
 
         # Parâmetros Heston (com gradiente habilitado para a EDP)
         # Detach para quebrar o grafo da LSTM (não precisamos derivar até a LSTM aqui)
+        # Garantir que permaneçam no device correto
         fixed_heston_params = (
-            nu.detach().requires_grad_(True),
-            theta.detach().requires_grad_(True),
-            kappa.detach().requires_grad_(True),
-            xi.detach().requires_grad_(True),
-            rho.detach().requires_grad_(True)
+            nu.detach().to(self.device).requires_grad_(True),
+            theta.detach().to(self.device).requires_grad_(True),
+            kappa.detach().to(self.device).requires_grad_(True),
+            xi.detach().to(self.device).requires_grad_(True),
+            rho.detach().to(self.device).requires_grad_(True)
         )
         
         return x_phy_synthetic, fixed_heston_params, S_grid, T_grid, asset_ids_synthetic
@@ -170,19 +238,29 @@ class Visualizer:
     # =========================================================================
 
     def plot_prediction_scatter(self):
-        """Real vs Previsto (Scatter colorido por Tempo)."""
+        """
+        Gráfico Scatter: Previsão (Y) vs Real (X).
+        Colorido pelo Tempo para Maturidade (T) para identificar viés temporal.
+        """
         try:
             data = self._run_inference()
-            y_real = data['price_real'].flatten()
-            y_pred = data['price_pred'].flatten()
-            t_maturity = data['inputs_phy'][:, 2].flatten()
+            # 1. Recuperar K Real para desnormalizar preços
+            K_norm = data['inputs_phy'][:, 1]
+            K_real = self._denormalize(K_norm, 'K')
+            
+            # 2. Preços Reais (P = P_norm * K_real)
+            y_real = data['price_real'].flatten() * K_real
+            y_pred = data['price_pred'].flatten() * K_real
+            
+            # 3. Tempo Real (para cor)
+            T_real = self._denormalize(data['inputs_phy'][:, 2], 'T').flatten()
             
             r2 = r2_score(y_real, y_pred)
             
             plt.figure(figsize=(7, 6))
             # Otimização: se tiver muitos pontos, plota sem borda e menor
             s_size = 5 if len(y_real) > 10000 else 10
-            sc = plt.scatter(y_real, y_pred, alpha=0.3, s=s_size, c=t_maturity, cmap='viridis', label='Amostras')
+            sc = plt.scatter(y_real, y_pred, alpha=0.3, s=s_size, c=T_real, cmap='viridis', label='Amostras')
             
             max_val = max(y_real.max(), y_pred.max())
             plt.plot([0, max_val], [0, max_val], 'r--', linewidth=1.5, label='Identidade')
@@ -199,7 +277,10 @@ class Visualizer:
             logger.error(f"Erro no scatter plot: {e}")
 
     def plot_premium_over_time(self):
-        """Plot 1: Evolução Temporal Simples (Global)."""
+        """
+        Série Temporal: Média diária de preços (Real vs Previsto).
+        Verifica se o modelo captura a tendência macro do mercado.
+        """
         try:
             data = self._run_inference()
             y_real, y_pred = data['price_real'].flatten(), data['price_pred'].flatten()
@@ -217,7 +298,10 @@ class Visualizer:
         except Exception as e: logger.error(f"Erro premium_over_time: {e}")
 
     def plot_premium_by_moneyness_time(self):
-        """Plot 2 (NOVO): Evolução Temporal segmentada por Moneyness (ITM/ATM/OTM)."""
+        """
+        Série Temporal Segmentada: ITM, ATM, OTM.
+        Permite identificar se o erro está concentrado em alguma região específica.
+        """
         try:
             data = self._run_inference()
             if data['times'] is None: return
@@ -257,7 +341,10 @@ class Visualizer:
         except Exception as e: logger.error(f"Erro premium_by_moneyness_time: {e}")
 
     def plot_distribution_overlay(self):
-        """Comparação das distribuições de preços (Detecta colapso)."""
+        """
+        Histograma Comparativo: Densidade Real vs Prevista.
+        Detecta colapso de modo (ex: se o modelo prevê sempre a média).
+        """
         try:
             data = self._run_inference()
             y_real = data['price_real'].flatten()
@@ -278,16 +365,23 @@ class Visualizer:
             logger.error(f"Erro no distribution overlay: {e}")
 
     def plot_residuals(self):
-        """ Resíduos (Real - Previsto) vs Moneyness."""
+        """
+        Scatter: Resíduo (Erro) vs Moneyness.
+        Verifica se há viés sistemático (ex: erro cresce ITM?).
+        """
         try:
             data = self._run_inference()
-            y_real = data['price_real'].flatten()
-            y_pred = data['price_pred'].flatten()
             
-            S = data['inputs_phy'][:, 0].flatten()
-            K = data['inputs_phy'][:, 1].flatten()
-            moneyness = S / (K + 1e-8) 
+            # 1. Desnormalizar Inputs
+            S_real = self._denormalize(data['inputs_phy'][:, 0], 'S').flatten()
+            K_real = self._denormalize(data['inputs_phy'][:, 1], 'K').flatten()
             
+            # 2. Desnormalizar Preços
+            y_real = data['price_real'].flatten() * K_real
+            y_pred = data['price_pred'].flatten() * K_real
+            
+            # 3. Calcular Moneyness Real (S/K) e Resíduos
+            moneyness = S_real / (K_real + 1e-8)
             residuals = y_pred - y_real
             
             plt.figure(figsize=(8, 5))
@@ -304,7 +398,10 @@ class Visualizer:
              logger.error(f"Erro no plot de resíduos: {e}")
 
     def plot_error_by_moneyness(self):
-        """MAE por categoria de Moneyness."""
+        """
+        Barplot: Erro Médio Absoluto (MAE) por Região.
+        Quantifica onde o modelo erra mais.
+        """
         try:
             data = self._run_inference()
             S = data['inputs_phy'][:, 0].flatten() * (self.data_stats['S_max'] - self.data_stats['S_min']) + self.data_stats['S_min']
@@ -325,8 +422,62 @@ class Visualizer:
         except Exception as e:
             logger.warning(f"Não foi possível plotar erro por moneyness: {e}")
 
+    def plot_error_distribution(self):
+        """
+        Diagnóstico de Normalidade dos Resíduos.
+        Inclui Histograma e QQ-Plot.
+        """
+        try:
+            from scipy import stats
+            
+            data = self._run_inference()
+            y_real = data['price_real'].flatten()
+            y_pred = data['price_pred'].flatten()
+            
+            errors = y_pred - y_real
+            
+            fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Histograma dos erros com KDE
+            ax1 = axes[0]
+            sns.histplot(errors, bins=50, kde=True, ax=ax1, color='skyblue', edgecolor='black', alpha=0.7)
+            ax1.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero')
+            ax1.set_xlabel('Erro (Previsto - Real)')
+            ax1.set_ylabel('Frequência')
+            ax1.set_title('Distribuição dos Erros de Previsão')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # Estatísticas
+            mean_error = np.mean(errors)
+            std_error = np.std(errors)
+            ax1.text(0.02, 0.98, f'Média: {mean_error:.4f}\nStd: {std_error:.4f}', 
+                    transform=ax1.transAxes, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            # QQ-plot dos resíduos
+            ax2 = axes[1]
+            # Limitar a 5000 pontos para performance
+            sample_size = min(5000, len(errors))
+            errors_sample = np.random.choice(errors, sample_size, replace=False)
+            stats.probplot(errors_sample, dist="norm", plot=ax2)
+            ax2.set_title('QQ-Plot dos Resíduos (Normalidade)')
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.save_dir, 'error_distribution.png'))
+            plt.close()
+            
+            logger.info(f"Distribuição de erros plotada. Média={mean_error:.4f}, Std={std_error:.4f}")
+            
+        except Exception as e:
+            logger.error(f"Erro ao plotar distribuição de erros: {e}")
+
     def plot_heston_params(self):
-        """Distribuição dos parâmetros inferidos."""
+        """
+        Distribuição dos Parâmetros Heston Inferidos pela PINN, 
+        para verificar se estão em faixas realistas. 
+        """
         try:
             data = self._run_inference()
             params = data['heston_params']
@@ -344,7 +495,9 @@ class Visualizer:
             logger.error(f"Erro ao plotar params: {e}")
 
     def plot_latent_vol_evolution(self):
-        """Dinâmica da Volatilidade Estocástica."""
+        """
+        Dinâmica da Volatilidade Estocástica ao Longo do Tempo.
+        """
         try:
             data = self._run_inference()
             nu_pred = data['heston_params'][:, 0]
@@ -362,7 +515,9 @@ class Visualizer:
             logger.error(f"Erro ao plotar vol evolution: {e}")
 
     def plot_delta_surface(self):
-        """Superfície 3D do Delta (Greeks)."""
+        """
+        Superfície do Delta (dV/dS) Aprendido pela PINN. 
+        """
         try:
             x_phy, heston_params, S_grid, T_grid, asset_ids = self._generate_synthetic_grid()
             if x_phy is None: return
@@ -391,18 +546,22 @@ class Visualizer:
             logger.error(f"Erro ao gerar delta surface: {e}")
 
     def plot_model_vs_bs_comparison(self):
-        """Comparação com Black-Scholes."""
+        """
+        Comparação com Black-Scholes.
+        Plota Preço Real vs Modelo vs BS com Volatilidade Fixa.
+        """
         try:
             data = self._run_inference()
             idx = np.random.choice(len(data['price_pred']), min(5000, len(data['price_pred'])), replace=False)
             
-            S = data['inputs_phy'][idx, 0] * (self.data_stats['S_max'] - self.data_stats['S_min']) + self.data_stats['S_min']
-            K = data['inputs_phy'][idx, 1] * (self.data_stats['K_max'] - self.data_stats['K_min']) + self.data_stats['K_min']
-            T = data['inputs_phy'][idx, 2] * self.data_stats['T_max']
-            r = data['inputs_phy'][idx, 3]
+            # 1. Desnormalização Obrigatória
+            S = self._denormalize(data['inputs_phy'][idx, 0], 'S')
+            K = self._denormalize(data['inputs_phy'][idx, 1], 'K')
+            T = self._denormalize(data['inputs_phy'][idx, 2], 'T')
+            r = self._denormalize(data['inputs_phy'][idx, 3], 'r')
             
-            real = data['price_real'][idx]
-            pred = data['price_pred'][idx]
+            real = data['price_real'][idx] * K
+            pred = data['price_pred'][idx] * K
             
             bs = black_scholes_price(S, K, T, r, 0.30)
             moneyness = S/K
@@ -424,24 +583,29 @@ class Visualizer:
             logger.error(f"Erro ao comparar BS: {e}")
 
     def plot_vol_smile(self):
-        """Plot: Smile de Volatilidade (Corrigido e Expandido)."""
+        """
+        Plot Smile de Volatilidade Implícita.
+        """
         try:
             data = self._run_inference()
             # Amostra aleatória para não pesar
             idx = np.random.choice(len(data['price_pred']), min(8000, len(data['price_pred'])), replace=False)
             
-            S = data['inputs_phy'][idx, 0] * (self.data_stats['S_max'] - self.data_stats['S_min']) + self.data_stats['S_min']
-            K = data['inputs_phy'][idx, 1] * (self.data_stats['K_max'] - self.data_stats['K_min']) + self.data_stats['K_min']
-            T = data['inputs_phy'][idx, 2] * self.data_stats['T_max']
-            r = data['inputs_phy'][idx, 3]
-            prices = data['price_pred'][idx]
+            # 1. Desnormalização Completa
+            S = self._denormalize(data['inputs_phy'][idx, 0], 'S')
+            K = self._denormalize(data['inputs_phy'][idx, 1], 'K')
+            T = self._denormalize(data['inputs_phy'][idx, 2], 'T')
+            r = self._denormalize(data['inputs_phy'][idx, 3], 'r')
+            
+            # Preço previsto em Reais
+            prices = data['price_pred'][idx] * K
             
             # Filtro mais permissivo: Maturidade entre 2 semanas e 6 meses
-            mask = (T > 0.04) & (T < 0.5)
+            mask = (T > 0.04) & (T < 0.5) 
             if mask.sum() < 50: return
 
             iv = bs_implied_vol_approx(S[mask], K[mask], T[mask], r[mask], prices[mask])
-            mon = K[mask] / S[mask]
+            mon = K[mask] / S[mask] # Moneyness do Smile (K/S)
             t_vals = T[mask] # Para cor
             
             # Limpeza de NaNs/Infs
@@ -460,7 +624,7 @@ class Visualizer:
             
             # Linhas de tendência quadrática para curto e médio prazo
             try:
-                # Curto prazo
+                # Tendência Curto prazo
                 mask_short = t_vals < 0.15
                 if mask_short.sum() > 10:
                     p_short = np.poly1d(np.polyfit(mon[mask_short], iv[mask_short], 2))
@@ -669,6 +833,7 @@ class Visualizer:
             ('plot_dist_overlay', self.plot_distribution_overlay),
             ('plot_residuals', self.plot_residuals),
             ('plot_error_by_moneyness', self.plot_error_by_moneyness),
+            ('plot_error_distribution', self.plot_error_distribution),
             ('plot_error_heatmap', self.plot_error_heatmap),
             ('plot_price_surface', self.plot_price_surface),
             ('plot_delta_surface', self.plot_delta_surface),

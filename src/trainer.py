@@ -44,8 +44,7 @@ class PINNTrainer:
             'avg_pred_vol': [],
             'avg_pred_price': [],
             'avg_real_price': [],
-            'learned_bias': [],  # Novo: monitorar bias aprendível
-            'moneyness_preservation': []  # Novo: monitorar preservação de moneyness
+            'moneyness_preservation': [] 
         }        
         self.best_val_loss = float('inf')
 
@@ -54,29 +53,6 @@ class PINNTrainer:
         if self.use_adaptive_weights:
             # Parâmetros treináveis: log(sigma^2) para Data e PDE
             self.log_vars = nn.Parameter(torch.zeros(2, device=self.device, requires_grad=True))
-    
-    def denormalize_price(self, y_normalized: torch.Tensor, K_real: torch.Tensor) -> torch.Tensor:
-        """
-        Desnormaliza preço: y_pred (normalizado por K) -> preço absoluto.
-        
-        Args:
-            y_normalized: Preço normalizado (y/K)
-            K_real: Strike price em escala real
-            
-        Returns:
-            Preço em escala absoluta (preço da opção em unidades monetárias)
-        """
-        # Fórmula: y_denorm = y_norm * K
-        # Garante dimensões compatíveis
-        if y_normalized.dim() > K_real.dim():
-            K_real = K_real.unsqueeze(-1)
-        
-        y_denorm = y_normalized * K_real
-        
-        # Garantir valores não-negativos (preços não podem ser negativos)
-        y_denorm = torch.clamp(y_denorm, min=0.0)
-        
-        return y_denorm
     
     def compute_loss(self, batch, weight_pde_curr):
         """Calcula a perda composta (dados + física) com curriculum learning."""
@@ -98,54 +74,60 @@ class PINNTrainer:
         # ===== VALIDAÇÃO CRÍTICA: ASSET_IDS =====
         if asset_ids is not None:
             asset_ids = asset_ids.to(self.device)
-            if self.model.use_embedding and asset_ids.shape[0] != x_seq.shape[0]:
-                logger.warning(
-                    f"Mismatch dimensão asset_ids ({asset_ids.shape[0]}) vs "
-                    f"x_seq ({x_seq.shape[0]}). Ajustando..."
-                )
-                asset_ids = asset_ids[:x_seq.shape[0]]
-        else:
-            logger.debug("Asset IDs são None - usando modelo sem embeddings")
-            if self.model.use_embedding:
-                logger.warning("Modelo configurado para usar embeddings mas asset_ids é None")
-
+            # Embedding check (opcional, se o modelo usar)
+            if hasattr(self.model, 'use_embedding') and self.model.use_embedding:
+                 if asset_ids.shape[0] != x_seq.shape[0]:
+                    logger.warning(
+                        f"Mismatch dimensão asset_ids ({asset_ids.shape[0]}) vs "
+                        f"x_seq ({x_seq.shape[0]}). Ajustando..."
+                    )
+                    asset_ids = asset_ids[:x_seq.shape[0]]
+        
         # Habilita gradiente para física
         x_phy.requires_grad_(True)
         
         # Forward Pass
         outputs = self.model(x_seq, x_phy, asset_ids)  
-        pred_price = outputs['price']  # Preço normalizado (P/K)
+        pred_price = outputs['price']  # Preço normalizado (P/K) ou semi-normalizado
         
-        # 1. Loss de Dados (MSE Ponderado) - usa preços normalizados
-        loss_data = torch.mean(weights * (pred_price - y_real) ** 2)
+        # 1. Recupera os valores reais (Desnormalização) para calcular Loss em Reais
+        K_norm = x_phy[:, 1:2]
+        # Recupera K_real usando a estatística correta (Std + Mean)
+        K_real = K_norm * self.data_stats['K_std'] + self.data_stats['K_mean']
+        
+        pred_price_real = pred_price * K_real
+        target_price_real = y_real * K_real 
+
+        # 2. Loss de Dados (MSE Ponderado)
+        # LIMPEZA: Voltamos para MSE puro (L2 Loss)
+        loss_data = torch.mean(weights * (pred_price_real - target_price_real)**2)
+
         weight_data = self.config['weight_data']
         
-        # 2. Loss da PDE (Heston) - também usa preços normalizados
+        # 3. Loss da PDE (Heston)
+        # Precisamos escalar o output para a PDE ver o preço real também, se necessário
+        # A função heston_residual lida com a física internamente, mas passamos o output original
+        # Se a PDE esperar preço real, ajustamos aqui. Por padrão, mantemos consistência com model.py
+        
+        # Nota: Ajustamos o output para passar o preço real para a PDE
+        out_phy = outputs.copy()
+        out_phy['price'] = pred_price_real 
+        
         lambda_bc = self.config.get('lambda_bc', 1.0)
         lambda_reg = self.config.get('lambda_reg', 0.01)
         
         physics_output = heston_residual(
-            outputs, 
+            out_phy, # Passa o output com preço real
             x_phy, 
             self.data_stats,
             lambda_bc=lambda_bc,
             lambda_reg=lambda_reg
         )
         
-        # Extrair componentes de physics (sempre retorna dicionário)
-        if not isinstance(physics_output, dict):
-            raise ValueError(
-                f"physics_output deve ser dict, recebido {type(physics_output)}. "
-                f"Verifique heston_residual() em src/physics.py"
-            )
-        
         loss_pde_total = physics_output['total']
         loss_pde = physics_output['pde']
         loss_bc = physics_output.get('bc', torch.tensor(0.0, device=self.device))
         loss_reg = physics_output.get('reg', torch.tensor(0.0, device=self.device))
-        
-        # 3. Regularização do Bias (evita que fique muito grande)
-        bias_reg = 0.01 * (self.model.price_bias ** 2)
         
         # 4. Combinação com Curriculum Learning
         if self.use_adaptive_weights:
@@ -154,11 +136,10 @@ class PINNTrainer:
             precision_pde = torch.exp(-self.log_vars[1])
             
             total_loss = (precision_data * loss_data + self.log_vars[0]) + \
-                         (precision_pde * loss_pde_total + self.log_vars[1]) + bias_reg
+                         (precision_pde * loss_pde_total + self.log_vars[1])
         else:
             # Pesos fixos com curriculum learning
-            weight_data = self.config.get('weight_data')
-            total_loss = weight_data * loss_data + weight_pde_curr * loss_pde_total + bias_reg
+            total_loss = self.config['weight_data'] * loss_data + weight_pde_curr * loss_pde_total
 
         return total_loss, loss_data, loss_pde_total, outputs
 
@@ -207,8 +188,6 @@ class PINNTrainer:
                 pred_price_acc = 0
                 real_price_acc = 0
                 num_samples_epoch = 0
-                bc_loss_acc = 0
-                reg_loss_acc = 0
 
                 # Loop de Batches
                 for batch in self.train_loader:
@@ -232,36 +211,39 @@ class PINNTrainer:
                     pde_loss_acc += l_pde.item()
                     
                     # Coleta métricas
-                    # CORRIGIDO: Verificação de 'heston_params' antes de acessar
                     if 'heston_params' in outputs and outputs['heston_params'] is not None:
                         nu = outputs['heston_params'][0]
+                        # Monitorar volatilidade média (raiz da variância nu)
                         pred_vol = torch.sqrt(torch.clamp(nu, min=1e-6)).mean().item()
                     else:
-                        pred_vol = 0.0  # Fallback se não houver parâmetros Heston
+                        pred_vol = 0.0  
                     
-                    pred_price = outputs['price'].mean().item()
+                    # Médias de preço para diagnóstico de viés
+                    pred_price_norm = outputs['price']
                     
-                    # y_real está no batch[2] (Normalizado P/K)
-                    y_real_batch = batch[2].to(self.device)
+                    # Desnormaliza para logar
                     x_phy_batch = batch[1].to(self.device)
+                    K_norm = x_phy_batch[:, 1:2]
+                    K_real = K_norm * self.data_stats['K_std'] + self.data_stats['K_mean']
                     
-                    # Desnormaliza y_real para logar o preço real em R$ (apenas para métricas)
-                    K_norm_batch = x_phy_batch[:, 1:2]
-                    # CORRECTED: Usar Z-score desnormalização (consistente com data_loader)
-                    K_real_batch = K_norm_batch * self.data_stats['K_std'] + self.data_stats['K_mean']
-                    y_real_denorm = y_real_batch * K_real_batch
+                    pred_price_real = pred_price_norm * K_real
                     
-                    real_price = y_real_denorm.mean().item()
+                    # Target Real
+                    y_real_batch = batch[2].to(self.device)
+                    target_price_real = y_real_batch * K_real
+                    
+                    pred_price_mean = pred_price_real.mean().item()
+                    real_price_mean = target_price_real.mean().item()
                     
                     pred_vol_acc += pred_vol
-                    pred_price_acc += pred_price
-                    real_price_acc += real_price
+                    pred_price_acc += pred_price_mean
+                    real_price_acc += real_price_mean
                     num_samples_epoch += 1
 
                 # Médias
-                avg_total = train_loss_acc / len(self.train_loader)
-                avg_data = data_loss_acc / len(self.train_loader)
-                avg_pde = pde_loss_acc / len(self.train_loader)
+                avg_total = train_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
+                avg_data = data_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
+                avg_pde = pde_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
 
                 # Validação
                 val_mse, val_mae = self.validate()
@@ -299,10 +281,6 @@ class PINNTrainer:
                     self.history['sigma_data'].append(None)
                     self.history['sigma_pde'].append(None)
                 
-                # Monitorar bias aprendível
-                learned_bias = self.model.price_bias.item()
-                self.history['learned_bias'].append(learned_bias)
-                
                 # Monitorar preservação de moneyness (apenas informativo)
                 self.history['moneyness_preservation'].append(self.data_stats.get('moneyness_mean', 0.0))
                 
@@ -310,10 +288,8 @@ class PINNTrainer:
                     'L_Tot': f"{avg_total:.4f}",
                     'L_Dat': f"{avg_data:.4e}",
                     'L_PDE': f"{avg_pde:.4e}",
-                    'L_Val': f"{val_mse:.4e}",
                     'MAE': f"{val_mae:.2f}", 
-                    'Bias': f"{diff_pred:+.2f}",
-                    'Bias_Param': f"{learned_bias:+.4f}"
+                    'Bias': f"{diff_pred:+.2f}"
                 })
                 
                 # Early Stopping
@@ -361,12 +337,12 @@ class PINNTrainer:
                 
                 # Desnormalização para métricas reais (R$)
                 K_norm = x_phy[:, 1:2]
-                # CORRECTED: Usar Z-score desnormalização (consistente com data_loader)
                 K_real = K_norm * self.data_stats['K_std'] + self.data_stats['K_mean']
                 
                 pred_price = pred_norm * K_real
                 real_price = y_norm * K_real
                 
+                # MSE e MAE em escala real
                 total_mse += torch.sum((pred_price - real_price)**2).item()
                 total_mae += torch.sum(torch.abs(pred_price - real_price)).item()
                 count += len(y_norm)

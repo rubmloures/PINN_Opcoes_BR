@@ -39,7 +39,7 @@ class FineTuner:
         self.paths = paths
         self.device = next(base_model.parameters()).device
         
-        # --- NOVO P2.1: Validar asset_map ---
+        # --- Validar asset_map ---
         if 'asset_map' not in data_stats:
             raise ValueError(
                 "data_stats não contém 'asset_map'. "
@@ -52,7 +52,7 @@ class FineTuner:
         
         logger.info(f"Asset map carregado: {list(self.asset_map.keys())}")
         
-        # --- NOVO P2.1: Validar estrutura do dataset ---
+        # --- Validar estrutura do dataset ---
         if len(full_dataset[0]) != 6:
             raise ValueError(
                 f"Dataset deve ter 6 elementos, encontrado {len(full_dataset[0])}. "
