@@ -13,3 +13,55 @@ dados/brutos/Databricks/ITUB4_2020.csv
 dados/brutos/Databricks/MGLU3_2020.csv
 dados/brutos/Databricks/PETR4_2020.csv
 dados/brutos/Databricks/VALE3_2020.csv
+
+dados/processados/treino*/*
+!dados/processados/treino*/.gitkeep
+
+dados/processados/teste/*
+!dados/processados/teste/.gitkeep
+
+dados/arquivos_diversos/*
+!dados/arquivos_diversos/.gitkeep
+
+dados/src/__pycache__/*
+!dados/src/__pycache__/.gitkeep
+
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================================================
+# Virtual Environments
+# ============================================================================
+.venv
+venv/
+env/
+ENV/

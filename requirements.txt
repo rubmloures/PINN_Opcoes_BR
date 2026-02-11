@@ -1,8 +1,7 @@
 # requirements.txt
 
 # Core de Machine Learning e computação numérica
-torch==2.8.0+cu126 --index-url https://download.pytorch.org/whl/cu126
-torchvision==0.23.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+#torch torchvision --index-url https://download.pytorch.org/whl/cu126
 numpy==1.26.4
 scikit-learn==1.7.2
 
@@ -12,6 +11,8 @@ pandas==2.3.2
 # Visualização de dados
 matplotlib==3.10.6
 seaborn==0.12.4
+plotly==5.18.0  # Para visualizações interativas em HTML
+kaleido==0.2.1  # Para exportar plots em PNG/SVG/PDF
 
 # Utilitários
 tqdm==4.67.1

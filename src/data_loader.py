@@ -550,4 +550,3 @@ def criar_dataset_hibrido(caminho_pasta_opcoes: str, df_juros: pd.DataFrame, seq
         torch.from_numpy(weights),
         torch.from_numpy(X_asset) # Elemento 5
     ), data_stats
-

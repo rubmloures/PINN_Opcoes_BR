@@ -79,7 +79,7 @@ TRAINING_CONFIG = {
     # --- Curriculum Learning (Fases) ---
     # Lista de LRs: começa alto para exploração, diminui para refinamento
     'learning_rates': [1e-4, 5e-5, 1e-5, 1e-6], # Fases de LR decrescente 
-    'epochs_per_phase': 2,                    # Teto de épocas por fase 300
+    'epochs_per_phase': 5,                    # Teto de épocas por fase 300
     'patience': 2,                            # Paciência para acionar early stopping 50
     'min_delta': 1e-7,                          # Exige melhora real para continuar
     
@@ -97,22 +97,51 @@ TRAINING_CONFIG = {
     'resample_every': 50,      # A cada n épocas, gera novos pontos (S, t) para a PDE
 }
 
-# --- Configurações de Visualização ---
+# --- Configurações de Visualização (Plotly - Interativo) ---
 VIZ_CONFIG = {
-    'plot_loss': True,                      # Histórico de Loss (Treino vs Validação)
-    'plot_weights_history': True,           # Evolução dos pesos (Data vs PDE)
-    'plot_premium_time': True,              # Série temporal (Real vs Previsto)
-    'plot_model_vs_bs': True,               # Scatter: Modelo vs Black-Scholes vs Real
-    'plot_heston_params': True,             # Histograma dos parâmetros estocásticos
-    'plot_price_scatter': True,             # Scatter: Real vs Previsto (com R²)
-    'plot_dist_overlay': True,              # Histograma comparativo de distribuições
-    'plot_residuals': True,                 # Resíduos vs Moneyness
-    'plot_error_by_moneyness': True,        # Barplot de MAE por região
-    'plot_error_heatmap': True,             # Mapa de calor 2D do erro (S vs T)
-    'plot_price_surface': True,             # Superfície 3D de Preço
-    'plot_delta_surface': True,             # Superfície 3D do Delta
-    'plot_pde_residual': True,              # Superfície 3D do Resíduo da Física
-    'plot_vol_smile': True,                 # Volatilidade Implícita vs Moneyness
-    'plot_latent_vol': True,                # Evolução da volatilidade (nu)
-    'plot_premium_by_moneyness_time': True, # Heatmap do prêmio por moneyness ao longo do tempo
+    # Validação Física - Histórico
+    'plot_loss_convergence': True,
+    'plot_weights_history': True,            
+    # Validação de Precificação
+    'plot_price_scatter': True,
+    'plot_residuals': True,
+    'plot_error_by_moneyness': True,            
+    # Superfícies e Gregas
+    'plot_price_surface': True,
+    'plot_delta_surface': True,
+    'plot_pde_residual': True,            
+    # Validação LSTM
+    'plot_heston_params': True,            
+    # Placeholders compatibilidade)
+    'plot_premium_time': True,
+    'plot_model_vs_bs': True,
+    'plot_dist_overlay': True,
+    'plot_error_distribution': True,
+    'plot_error_heatmap': True,
+    'plot_vol_smile': True,
+    'plot_latent_vol_evolution': True,
+    'plot_premium_by_moneyness_time': True,
 }
+
+
+#VIZ_CONFIG = {
+    #'run_benchmark_first': True,             # Executa benchmark_calibration antes dos plots
+    #'export_plots_png': True,                # Exporta plots também em PNG (requer kaleido)
+#    
+    ## ===== SEÇÃO A: VALIDAÇÃO DO LSTM vs GROUND TRUTH =====
+    #'plot_lstm_heston_params': True,         # Scatter LSTM vs Ground Truth (parâmetros Heston)
+    #'plot_lstm_residuals': True,             # Histograma de resíduos (erros dos parâmetros)
+    #'plot_lstm_timeseries': True,            # Série temporal: parâmetros reais vs previstos
+#    
+    ## ===== SEÇÃO B: VALIDAÇÃO DA PINN =====
+    #'plot_loss_convergence': True,           # Convergência: Loss Data, PDE, BC, IC
+    #'plot_overfitting_detection': True,      # Learning Curves (Train vs Validation)
+#    
+    ## ===== SEÇÃO C: VALIDAÇÃO DO MODELO INTEGRADO =====
+    #'plot_pricing_error': True,              # MAPE, MAE, RMSE, R² de precificação
+    #'plot_prediction_intervals': True,       # Intervalos de confiança (bandas de predição)
+    #'plot_greeks_surface': True,             # Superfícies 3D de Gregas (Delta, Gamma, Vega)
+#    
+    ## ===== SEÇÃO D: FINE-TUNING PROGRESS =====
+    #'plot_finetuning': True,                 # Progresso do fine-tuning por ativo
+#}

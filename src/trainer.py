@@ -5,6 +5,7 @@ import torch.nn as nn
 import numpy as np
 import time
 import os
+from copy import deepcopy
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from src.physics import heston_residual
