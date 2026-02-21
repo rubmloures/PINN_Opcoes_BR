@@ -70,29 +70,29 @@ TRAINING_CONFIG = {
     'use_adaptive_weights': False,  # Ativado para balancear Data vs PDE dinamicamente
     # Pesos Fixos Manuais (usados quando use_adaptive_weights=False)
     'weight_data': 1.0,          # Peso da loss de dados (normalizada)
-    'weight_pde': 0.1,          # Peso da loss de física 
+    'weight_pde': 2.0,           # Peso da loss de física 
     
     # Curriculum
     'warmup_epochs': 20,        # Épocas iniciais com peso físico ZERO (só aprende dados)
-    'rampup_epochs': 50,        # Épocas para subir o peso físico de 0 até o target
+    'rampup_epochs': 100,       # Épocas para subir o peso físico de 0 até o target
     
     # --- Curriculum Learning (Fases) ---
     # Lista de LRs: começa alto para exploração, diminui para refinamento
-    'learning_rates': [1e-4, 5e-5, 1e-5, 1e-6], # Fases de LR decrescente 
-    'epochs_per_phase': 5,                    # Teto de épocas por fase 300
-    'patience': 2,                            # Paciência para acionar early stopping 50
+    'learning_rates': [1e-3, 5e-4, 1e-4, 1e-5], # Fases de LR decrescente 
+    'epochs_per_phase': 100,                    # Teto de épocas por fase 300
+    'patience': 20,                            # Paciência para acionar early stopping 50
     'min_delta': 1e-7,                          # Exige melhora real para continuar
     
     # --- Fine-Tuning (Especialização por Ativo) ---
-    'finetune_epochs': 2,              # Épocas por ativo
+    'finetune_epochs': 50,              # Épocas por ativo
     'finetune_learning_rate': 1e-4,     # LR específico para fine-tune
-    'finetune_batch_size': 256,         # Batch menor para dados específicos do ativo
+    'finetune_batch_size': 1024,         # Batch menor para dados específicos do ativo
     'finetune_patience': 10,            # Early stopping mais permissivo
 
     # --- Pesos para Física Avançada (Literature-Based) ---
-    'lambda_bc': 1.0,         # Peso para boundary conditions (Heston 1993, Beck et al. 2019)
-    'lambda_reg': 0.01,       # Peso para regularização física dos parâmetros (Wang et al. 2020)
-    
+    'lambda_bc': 10.0,         # Peso para boundary conditions (Heston 1993, Beck et al. 2019)
+    'lambda_reg': 0.01,        # Peso para regularização física dos parâmetros (Wang et al. 2020)
+    'lambda_feller': 10.0,     # Peso para penalizar violações da condição de Feller (nu*theta >= 0.5*xi^2)
     # --- Amostragem por Importância ---
     'resample_every': 50,      # A cada n épocas, gera novos pontos (S, t) para a PDE
 }
@@ -124,24 +124,3 @@ VIZ_CONFIG = {
 }
 
 
-#VIZ_CONFIG = {
-    #'run_benchmark_first': True,             # Executa benchmark_calibration antes dos plots
-    #'export_plots_png': True,                # Exporta plots também em PNG (requer kaleido)
-#    
-    ## ===== SEÇÃO A: VALIDAÇÃO DO LSTM vs GROUND TRUTH =====
-    #'plot_lstm_heston_params': True,         # Scatter LSTM vs Ground Truth (parâmetros Heston)
-    #'plot_lstm_residuals': True,             # Histograma de resíduos (erros dos parâmetros)
-    #'plot_lstm_timeseries': True,            # Série temporal: parâmetros reais vs previstos
-#    
-    ## ===== SEÇÃO B: VALIDAÇÃO DA PINN =====
-    #'plot_loss_convergence': True,           # Convergência: Loss Data, PDE, BC, IC
-    #'plot_overfitting_detection': True,      # Learning Curves (Train vs Validation)
-#    
-    ## ===== SEÇÃO C: VALIDAÇÃO DO MODELO INTEGRADO =====
-    #'plot_pricing_error': True,              # MAPE, MAE, RMSE, R² de precificação
-    #'plot_prediction_intervals': True,       # Intervalos de confiança (bandas de predição)
-    #'plot_greeks_surface': True,             # Superfícies 3D de Gregas (Delta, Gamma, Vega)
-#    
-    ## ===== SEÇÃO D: FINE-TUNING PROGRESS =====
-    #'plot_finetuning': True,                 # Progresso do fine-tuning por ativo
-#}

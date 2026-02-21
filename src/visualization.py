@@ -382,9 +382,48 @@ class Visualizer:
                     fig.write_image(output_path.replace('.html', '.png'), width=1400, height=700)
                 except Exception as e:
                     logger.warning(f"Falha ao exportar PNG (kaleido necessário): {e}")
+                    
+            return fig
         
         except Exception as e:
             logger.error(f"Erro em plot_loss_history: {e}")
+            
+    def plot_loss_convergence_hybrid(self):
+        """
+        Alias para plot_loss_history com suporte a subplots específicos de PINN.
+        """
+        return self.plot_loss_history()
+
+    def plot_overfitting_detection(self):
+        """
+        Gera gráfico comparativo entre erro de treino e validação.
+        """
+        if self.history is None or self.history.empty:
+            return None
+            
+        try:
+            fig = go.Figure()
+            epochs = np.arange(len(self.history))
+            
+            # Treino vs Validação
+            if 'train_loss' in self.history.columns and 'val_loss' in self.history.columns:
+                fig.add_trace(go.Scatter(x=epochs, y=self.history['train_loss'], name='Train Loss'))
+                fig.add_trace(go.Scatter(x=epochs, y=self.history['val_loss'], name='Val Loss'))
+            
+            fig.update_layout(
+                title="Detecção de Overfitting: Train vs Val Loss",
+                xaxis_title="Época",
+                yaxis_title="Loss",
+                yaxis_type="log",
+                template='plotly_white'
+            )
+            
+            output_path = os.path.join(self.save_dir, 'overfitting_detection.html')
+            fig.write_html(output_path)
+            return fig
+        except Exception as e:
+            logger.error(f"Erro em plot_overfitting_detection: {e}")
+            return None
     
     def plot_weights_history(self):
         """

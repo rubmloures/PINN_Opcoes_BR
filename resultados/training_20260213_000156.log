@@ -1,0 +1,9 @@
+[2026-02-13 00:01:56] [PINN_Main] [INFO] Log file criado: /home/rubens/projeto/PINN/Model/PINN_Opcoes_BR/resultados/training_20260213_000156.log
+[2026-02-13 00:01:56] [PINN_Main] [INFO] Iniciando Pipeline Heston-LSTM Híbrido
+[2026-02-13 00:01:56] [PINN_Main] [INFO] [Fase 1] Carregando dados e gerando sequências temporais...
+[2026-02-13 00:02:18] [PINN_Main] [INFO] Ativos detectados no dataset: 14
+[2026-02-13 00:02:18] [PINN_Main] [INFO] MODEL_CONFIG['num_assets'] atualizado para: 14
+[2026-02-13 00:02:18] [PINN_Main] [INFO] Estatísticas salvas em: /home/rubens/projeto/PINN/Model/PINN_Opcoes_BR/resultados/modelo_final/data_stats.json
+[2026-02-13 00:02:18] [PINN_Main] [INFO] Datasets prontos: Treino (1836884) | Validação (459220)
+[2026-02-13 00:02:18] [PINN_Main] [INFO] [Fase 2] Inicializando DeepHestonHybrid...
+[2026-02-13 00:02:18] [PINN_Main] [INFO] [Fase 3] Iniciando Treinamento...

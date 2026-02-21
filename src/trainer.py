@@ -116,6 +116,7 @@ class PINNTrainer:
         
         lambda_bc = self.config.get('lambda_bc', 1.0)
         lambda_reg = self.config.get('lambda_reg', 0.01)
+        lambda_feller = self.config.get('lambda_feller', 1.0)
         
         physics_output = heston_residual(
             out_phy, # Passa o output com preço real
