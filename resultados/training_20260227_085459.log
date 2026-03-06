@@ -1,0 +1,19 @@
+[2026-02-27 08:54:59] [PINN_Main] [INFO] Log file criado: /home/rubens/projeto_PINN/PINN_Opcoes_BR/resultados/training_20260227_085459.log
+[2026-02-27 08:54:59] [PINN_Main] [INFO] Iniciando Pipeline Heston-LSTM Híbrido
+[2026-02-27 08:54:59] [PINN_Main] [INFO] [Fase 0] Otimização Optuna (50 trials, 5 épocas/trial)...
+[2026-02-27 08:54:59] [PINN_Main] [ERROR] Otimização Optuna falhou: Optuna não instalado. Execute: pip install optuna. Continuando com configs padrão.
+[2026-02-27 08:54:59] [PINN_Main] [INFO] [Fase 1] Carregando dados e gerando sequências temporais...
+[2026-02-27 08:55:55] [PINN_Main] [INFO] Ativos detectados no dataset: 14
+[2026-02-27 08:55:55] [PINN_Main] [INFO] MODEL_CONFIG['num_assets'] atualizado para: 14
+[2026-02-27 08:55:55] [PINN_Main] [INFO] Estatísticas salvas em: /home/rubens/projeto_PINN/PINN_Opcoes_BR/resultados/modelo_final/data_stats.json
+[2026-02-27 08:55:55] [PINN_Main] [INFO] Divisão Temporal Aplicada:
+[2026-02-27 08:55:55] [PINN_Main] [INFO]   > Treino: Até 31/12/2024 (3123886 amostras)
+[2026-02-27 08:55:55] [PINN_Main] [INFO]   > Validação: 2025 Q1/Q2 (436410 amostras)
+[2026-02-27 08:55:55] [PINN_Main] [INFO] Datasets prontos: Treino (3123886) | Validação (436410)
+[2026-02-27 08:55:55] [PINN_Main] [INFO] [Fase 2] Inicializando DeepHestonHybrid...
+[2026-02-27 08:55:55] [PINN_Main] [INFO] [Fase 3] Iniciando Treinamento...
+[2026-02-27 11:06:17] [PINN_Main] [INFO] [Fase 4] Iniciando Especialização por Ativo...
+[2026-02-27 11:08:57] [PINN_Main] [INFO] [Fase 5] Gerando Diagnósticos Visuais...
+[2026-02-27 11:09:01] [PINN_Main] [INFO] Pipeline Finalizado com Sucesso
+[2026-02-27 11:09:01] [PINN_Main] [INFO] Modelo salvo em: /home/rubens/projeto_PINN/PINN_Opcoes_BR/resultados/modelo_final
+[2026-02-27 11:09:01] [PINN_Main] [INFO] Plots salvos em: /home/rubens/projeto_PINN/PINN_Opcoes_BR/resultados/plots

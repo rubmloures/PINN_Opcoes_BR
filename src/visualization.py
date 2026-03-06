@@ -150,7 +150,7 @@ class Visualizer:
             return self.preds_cache
 
         self.model.eval()
-        results = {'pred': [], 'real': [], 'params': [], 'phy': [], 'times': []}
+        results = {'pred': [], 'real': [], 'params': [], 'phy': [], 'times': [], 'asset_ids': []}
 
         logger.info("Executando inferência completa no dataset de validação...")
         with torch.no_grad():
@@ -188,6 +188,7 @@ class Visualizer:
                     results['params'].append(params_concat.cpu().numpy())
                 
                 results['phy'].append(x_phy.cpu().numpy())
+                results['asset_ids'].append(asset_ids.cpu().numpy())
                 
                 if times is not None:
                     results['times'].append(times.numpy() if torch.is_tensor(times) else times)
@@ -198,7 +199,8 @@ class Visualizer:
             'price_real': np.concatenate(results['real']),
             'heston_params': np.concatenate(results['params']) if results['params'] else None,
             'inputs_phy': np.concatenate(results['phy']),
-            'times': np.concatenate(results['times']) if results['times'] else None
+            'times': np.concatenate(results['times']) if results['times'] else None,
+            'asset_ids': np.concatenate(results['asset_ids']) if results['asset_ids'] else None
         }
         return self.preds_cache
     
@@ -208,7 +210,7 @@ class Visualizer:
         Usa _run_inference internamente.
         
         Returns:
-            (y_real, y_pred, S, K, T, params) - 6 arrays numpy
+            (y_real, y_pred, S, K, T, params, r, q) - Note: returning more values for internal use
         """
         data = self._run_inference()
         
@@ -216,44 +218,59 @@ class Visualizer:
         y_real = data['price_real'].flatten()
         y_pred = data['price_pred'].flatten()
         
+        # Inputs Phy: [S, K, T, r, q]
         S = data['inputs_phy'][:, 0].flatten()
         K = data['inputs_phy'][:, 1].flatten()
         T = data['inputs_phy'][:, 2].flatten()
+        r = data['inputs_phy'][:, 3].flatten() if data['inputs_phy'].shape[1] > 3 else np.zeros_like(S)
+        q = data['inputs_phy'][:, 4].flatten() if data['inputs_phy'].shape[1] > 4 else np.zeros_like(S)
         
-        # Desnormalizar S, K, T
+        # Desnormalizar S, K, T, r, q
         S = S * self.data_stats['S_std'] + self.data_stats['S_mean']
         K = K * self.data_stats['K_std'] + self.data_stats['K_mean']
         T = T * self.data_stats['T_std'] + self.data_stats['T_mean']
+        r = r * self.data_stats.get('r_std', 1.0) + self.data_stats.get('r_mean', 0.0)
+        q = q * self.data_stats.get('q_std', 1.0) + self.data_stats.get('q_mean', 0.0)
         
         params = data['heston_params'] if data['heston_params'] is not None else np.zeros((len(y_real), 5))
         
-        return y_real, y_pred, S, K, T, params
+        return y_real, y_pred, S, K, T, params, r, q
     
     def run_inference(self):
         """
         Adaptador: Executa get_predictions e retorna um DataFrame pandas completo.
-        Resolve o erro: 'Visualizer' object has no attribute 'run_inference'
+        Retorna preços em unidades monetárias REAIS (R$).
         """
-        # Chama a função existente que retorna 6 valores
-        y_real, y_pred, S, K, T, params = self.get_predictions()
+        # Pega os arrays do cache interno para ter acesso aos metadados (times, ids)
+        data = self._run_inference()
         
-        # Cria o DataFrame esperado pelos novos plots
+        # Desempacota e desnormaliza
+        # y_real e y_pred aqui são os preços normalizados (Price/K)
+        y_real_norm, y_pred_norm, S, K, T, params, r, q = self.get_predictions()
+        
+        # Cria o DataFrame com preços em REAIS (multiplicando pelo Strike K)
         df = pd.DataFrame({
-            'Price_Real': y_real,
-            'Price_Pred': y_pred,
+            'Price_Real': y_real_norm * K,
+            'Price_Pred': y_pred_norm * K,
             'S': S,
             'K': K,
-            'T': T
+            'T': T,
+            'r': r,
+            'q': q,
+            'Moneyness': S / (K + 1e-8),
+            'Error': (y_real_norm - y_pred_norm) * K,
+            'Abs_Error': np.abs(y_real_norm - y_pred_norm) * K
         })
         
-        # Métricas derivadas
-        df['Moneyness'] = df['S'] / (df['K'] + 1e-8)
-        df['Error'] = df['Price_Real'] - df['Price_Pred']
-        df['Abs_Error'] = np.abs(df['Error'])
-        
+        # Metadados adicionais
+        if data.get('times') is not None:
+            df['Time_Stamp'] = data['times'].flatten()
+            
+        if data.get('asset_ids') is not None:
+            df['Asset_ID'] = data['asset_ids'].flatten()
+            
         # Adiciona parâmetros Heston
         param_names = ['Heston_nu', 'Heston_theta', 'Heston_kappa', 'Heston_xi', 'Heston_rho']
-        # Garante que temos colunas suficientes
         num_params = min(params.shape[1], len(param_names))
         for i in range(num_params):
             df[param_names[i]] = params[:, i]
@@ -1504,7 +1521,198 @@ class Visualizer:
             logger.error(f"Erro em plot_premium_by_moneyness_time: {e}")
     
     # ==========================================================================
-    # SEÇÃO 8: Função Principal de Execução
+    # SEÇÃO 8: Séries Históricas de Treinamento (Nova Feature)
+    # ==========================================================================
+
+    def plot_training_series(self):
+        """
+        Gera 3 plots interativos de séries históricas do treinamento,
+        mostrando a evolução de métricas-chave por época.
+
+        Plot a) avg_pred_price vs avg_real_price
+        Plot b) avg_pred_vol (sqrt(nu)) vs avg_real_price
+        Plot c) Parâmetros Heston (nu, theta, kappa, xi, rho) vs avg_real_price
+        """
+        try:
+            if self.history is None or self.history.empty:
+                logger.warning("Histórico de treinamento não disponível. Pulando plot_training_series.")
+                return
+
+            h = self.history.copy()
+            epochs = list(range(1, len(h) + 1))
+
+            # Paleta de cores consistente
+            BLUE   = '#2E86AB'
+            GREEN  = '#27AE60'
+            RED    = '#C0392B'
+            ORANGE = '#E67E22'
+            PURPLE = '#8E44AD'
+            GRAY   = '#7F8C8D'
+
+            # ------------------------------------------------------------------
+            # Plot a: avg_pred_price vs avg_real_price
+            # ------------------------------------------------------------------
+            fig_a = go.Figure()
+
+            if 'avg_pred_price' in h.columns and 'avg_real_price' in h.columns:
+                fig_a.add_trace(go.Scatter(
+                    x=epochs, y=h['avg_pred_price'],
+                    mode='lines', name='Preço Previsto (média)',
+                    line=dict(color=BLUE, width=2)
+                ))
+                fig_a.add_trace(go.Scatter(
+                    x=epochs, y=h['avg_real_price'],
+                    mode='lines', name='Preço Real (média)',
+                    line=dict(color=GREEN, width=2, dash='dash')
+                ))
+                # Faixas de fase (Curriculum Learning)
+                if 'lr' in h.columns:
+                    prev_lr = None
+                    phase_starts = []
+                    for i, lr_val in enumerate(h['lr']):
+                        if lr_val != prev_lr:
+                            phase_starts.append(i + 1)
+                            prev_lr = lr_val
+                    for ps in phase_starts[1:]:
+                        fig_a.add_vline(
+                            x=ps, line_dash='dot', line_color=GRAY, opacity=0.5,
+                            annotation_text=f'LR↓ Fase', annotation_position='top right'
+                        )
+            else:
+                fig_a.add_annotation(text="Dados de preço não encontrados no histórico.",
+                                     xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+
+            fig_a.update_layout(
+                title="▶ (a) Evolução dos Preços por Epoch",
+                xaxis_title="Epoch",
+                yaxis_title="Preço Médio (R$)",
+                template='plotly_white',
+                height=500,
+                legend=dict(orientation='h', y=-0.2),
+                hovermode='x unified'
+            )
+            path_a = os.path.join(self.save_dir, '0a_training_series_price.html')
+            fig_a.write_html(path_a)
+            logger.info(f"✓ Training series (a) salvo: {path_a}")
+
+            # ------------------------------------------------------------------
+            # Plot b: avg_pred_vol (sqrt(avg_nu)) vs avg_real_price (eixo duplo)
+            # ------------------------------------------------------------------
+            fig_b = make_subplots(specs=[[{'secondary_y': True}]])
+
+            # Volatilidade prevista (sqrt da variância média de Heston - nu)
+            if 'avg_pred_vol' in h.columns:
+                vol_series = h['avg_pred_vol']
+                fig_b.add_trace(
+                    go.Scatter(x=epochs, y=vol_series, mode='lines',
+                               name='Vol. Instantânea √ν (média)',
+                               line=dict(color=ORANGE, width=2)),
+                    secondary_y=False
+                )
+            elif 'avg_nu' in h.columns:
+                vol_series = h['avg_nu'].apply(lambda x: x**0.5 if x is not None and x >= 0 else 0)
+                fig_b.add_trace(
+                    go.Scatter(x=epochs, y=vol_series, mode='lines',
+                               name='Vol. Instantânea √ν (média)',
+                               line=dict(color=ORANGE, width=2)),
+                    secondary_y=False
+                )
+
+            if 'avg_real_price' in h.columns:
+                fig_b.add_trace(
+                    go.Scatter(x=epochs, y=h['avg_real_price'], mode='lines',
+                               name='Preço Real (média)',
+                               line=dict(color=GREEN, width=2, dash='dash')),
+                    secondary_y=True
+                )
+
+            fig_b.update_layout(
+                title="▶ (b) Volatilidade Prevista (√ν) vs Preço Real por Epoch",
+                xaxis_title="Epoch",
+                template='plotly_white',
+                height=500,
+                legend=dict(orientation='h', y=-0.2),
+                hovermode='x unified'
+            )
+            fig_b.update_yaxes(title_text="Volatilidade (Adimensional)", secondary_y=False)
+            fig_b.update_yaxes(title_text="Preço Real Médio (R$)", secondary_y=True)
+
+            path_b = os.path.join(self.save_dir, '0b_training_series_vol.html')
+            fig_b.write_html(path_b)
+            logger.info(f"✓ Training series (b) salvo: {path_b}")
+
+            # ------------------------------------------------------------------
+            # Plot c: Parâmetros Heston médios (nu, theta, kappa, xi, rho) vs
+            # avg_real_price (eixo secundário)
+            # ------------------------------------------------------------------
+            heston_cols = {
+                'avg_nu':    ('ν (vol instantânea)',    BLUE),
+                'avg_theta': ('θ (vol longo prazo)',     GREEN),
+                'avg_kappa': ('κ (reversão à média)',  RED),
+                'avg_xi':    ('ξ (vol da vol)',          ORANGE),
+                'avg_rho':   ('ρ (correlação S-v)',     PURPLE),
+            }
+            available_heston = {k: v for k, v in heston_cols.items() if k in h.columns}
+
+            fig_c = make_subplots(specs=[[{'secondary_y': True}]])
+
+            if available_heston:
+                for col, (label, color) in available_heston.items():
+                    fig_c.add_trace(
+                        go.Scatter(x=epochs, y=h[col], mode='lines', name=label,
+                                   line=dict(color=color, width=1.5)),
+                        secondary_y=False
+                    )
+            else:
+                fig_c.add_annotation(
+                    text="Parâmetros Heston não encontrados no histórico.<br>"
+                         "Execute um novo treinamento para gerar esses dados.",
+                    xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+                    font=dict(size=14)
+                )
+
+            # Preços no eixo direito (comparação Real vs Previsto)
+            if 'avg_real_price' in h.columns:
+                fig_c.add_trace(
+                    go.Scatter(x=epochs, y=h['avg_real_price'], mode='lines',
+                               name='Preço Real (média)',
+                               line=dict(color=GRAY, width=1.5, dash='dot'),
+                               opacity=0.7),
+                    secondary_y=True
+                )
+            
+            if 'avg_pred_price' in h.columns:
+                fig_c.add_trace(
+                    go.Scatter(x=epochs, y=h['avg_pred_price'], mode='lines',
+                               name='Preço Previsto (média)',
+                               line=dict(color=BLUE, width=1.5, dash='dash'),
+                               opacity=0.6),
+                    secondary_y=True
+                )
+
+            fig_c.update_layout(
+                title="▶ (c) Parâmetros Heston (LSTM) vs Preços (Real/Pred) por Epoch",
+                xaxis_title="Epoch",
+                template='plotly_white',
+                height=550,
+                legend=dict(orientation='h', y=-0.25, bgcolor='rgba(255, 255, 255, 0.8)', bordercolor='lightgray', borderwidth=1),
+                hovermode='x unified'
+            )
+            fig_c.update_yaxes(title_text="Valor do Parâmetro Heston", secondary_y=False)
+            fig_c.update_yaxes(title_text="Preço Médio (R$)", secondary_y=True)
+
+            path_c = os.path.join(self.save_dir, '0c_training_series_heston.html')
+            fig_c.write_html(path_c)
+            logger.info(f"✓ Training series (c) salvo: {path_c}")
+            logger.info("Plots de série histórica gerados com sucesso.")
+
+        except Exception as e:
+            logger.error(f"Erro em plot_training_series: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    # ==========================================================================
+    # SEÇÃO 9: Função Principal de Execução
     # ==========================================================================
     
     def plot_all(self):
@@ -1518,6 +1726,9 @@ class Visualizer:
         
         # Lista de jobs (nome_config, função)
         jobs = [
+            # Novas séries históricas de treinamento (novo)
+            ('plot_training_series', self.plot_training_series),
+
             # Validação Física - Histórico
             ('plot_loss_convergence', self.plot_loss_history),
             ('plot_weights_history', self.plot_weights_history),

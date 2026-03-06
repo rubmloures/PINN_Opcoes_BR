@@ -44,8 +44,7 @@ MODEL_CONFIG = {
     'asset_embedding_dim': 4,   # Dimensão do vetor latente por ativo
 
     # Configs da PINN (O Físico)
-    # Input: 5 (S,K,T,r,q) + 5 (Parâmetros Heston: nu, theta, kappa, xi, rho)   
-    # q = dividend yield
+    # Input: 5 (S, K, T, rolling_vol_20, ewma_vol) + 5 (Parâmetros Heston: nu, theta, kappa, xi, rho)   
     # Total input da rede densa = 10
     'pinn_hidden_layers': 4,        # Camadas ocultas da PINN
     'pinn_neurons': 64,             # Neurônios por camada oculta
@@ -64,23 +63,23 @@ TRAINING_CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     # Performance GPU
     'batch_size': 4096,       # Alto para maximizar throughput da GPU
-    'phy_batch_size': 4096,   # Pontos de colocação da EDP
+    'phy_batch_size': 8192,   # Pontos de colocação da EDP
     
     # Pesos Adaptativos
     'use_adaptive_weights': False,  # Ativado para balancear Data vs PDE dinamicamente
     # Pesos Fixos Manuais (usados quando use_adaptive_weights=False)
-    'weight_data': 1.0,          # Peso da loss de dados (normalizada)
+    'weight_data': 10.0,          # Peso da loss de dados (normalizada)
     'weight_pde': 2.0,           # Peso da loss de física 
     
     # Curriculum
-    'warmup_epochs': 20,        # Épocas iniciais com peso físico ZERO (só aprende dados)
-    'rampup_epochs': 100,       # Épocas para subir o peso físico de 0 até o target
+    'warmup_epochs': 50,        # Épocas iniciais com peso físico ZERO (só aprende dados)
+    'rampup_epochs': 150,       # Épocas para subir o peso físico de 0 até o target
     
     # --- Curriculum Learning (Fases) ---
     # Lista de LRs: começa alto para exploração, diminui para refinamento
-    'learning_rates': [1e-3, 5e-4, 1e-4, 1e-5], # Fases de LR decrescente 
-    'epochs_per_phase': 100,                    # Teto de épocas por fase 300
-    'patience': 20,                            # Paciência para acionar early stopping 50
+    'learning_rates': [3e-4, 1e-4, 5e-5, 1e-5], # Fases de LR decrescente 
+    'epochs_per_phase': 300,                    # Teto de épocas por fase 300
+    'patience': 80,                            # Paciência para acionar early stopping 50
     'min_delta': 1e-7,                          # Exige melhora real para continuar
     
     # --- Fine-Tuning (Especialização por Ativo) ---
@@ -90,20 +89,22 @@ TRAINING_CONFIG = {
     'finetune_patience': 10,            # Early stopping mais permissivo
 
     # --- Pesos para Física Avançada (Literature-Based) ---
-    'lambda_bc': 10.0,         # Peso para boundary conditions (Heston 1993, Beck et al. 2019)
+    'lambda_bc': 2.0,         # Peso para boundary conditions (Heston 1993, Beck et al. 2019)
     'lambda_reg': 0.01,        # Peso para regularização física dos parâmetros (Wang et al. 2020)
-    'lambda_feller': 10.0,     # Peso para penalizar violações da condição de Feller (nu*theta >= 0.5*xi^2)
+    'lambda_feller': 5.0,     # Peso para penalizar violações da condição de Feller (nu*theta >= 0.5*xi^2)
     # --- Amostragem por Importância ---
-    'resample_every': 50,      # A cada n épocas, gera novos pontos (S, t) para a PDE
+    'resample_every': 20,      # A cada n épocas, gera novos pontos (S, t) para a PDE
 }
 
 # --- Configurações de Visualização (Plotly - Interativo) ---
 VIZ_CONFIG = {
+    # Séries Históricas de Treinamento (Nova Feature)
+    'plot_training_series': True,
     # Validação Física - Histórico
-    'plot_loss_convergence': True,
+    'plot_loss_convergence': True,  
     'plot_weights_history': True,            
     # Validação de Precificação
-    'plot_price_scatter': True,
+    'plot_price_scatter': True,  
     'plot_residuals': True,
     'plot_error_by_moneyness': True,            
     # Superfícies e Gregas

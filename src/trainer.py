@@ -10,7 +10,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from src.physics import heston_residual
 from src.config import TRAINING_CONFIG, PATHS
-from src.utils import salvar_historico_treinamento
+from src.utils import salvar_historico_treinamento, validate_normalization
 from src.logger import get_logger
 
 # Configurar logger
@@ -45,7 +45,13 @@ class PINNTrainer:
             'avg_pred_vol': [],
             'avg_pred_price': [],
             'avg_real_price': [],
-            'moneyness_preservation': [] 
+            'moneyness_preservation': [],
+            # Parâmetros Heston médios por época (saída da LSTM)
+            'avg_nu': [],
+            'avg_theta': [],
+            'avg_kappa': [],
+            'avg_xi': [],
+            'avg_rho': [],
         }        
         self.best_val_loss = float('inf')
 
@@ -99,9 +105,13 @@ class PINNTrainer:
         pred_price_real = pred_price * K_real
         target_price_real = y_real * K_real 
 
-        # 2. Loss de Dados (MSE Ponderado)
-        # LIMPEZA: Voltamos para MSE puro (L2 Loss)
-        loss_data = torch.mean(weights * (pred_price_real - target_price_real)**2)
+        # 2. Loss de Dados (Huber Loss Ponderado)
+        # Huber Loss (delta=1.0) é mais robusto a outliers (opções de alto preço) 
+        # e força o modelo a focar no erro absoluto quando o erro é grande, 
+        # ajudando a derrubar o viés de +1.23.
+        huber_fn = nn.HuberLoss(reduction='none', delta=1.0)
+        loss_huber_raw = huber_fn(pred_price_real, target_price_real)
+        loss_data = torch.mean(weights * loss_huber_raw)
 
         weight_data = self.config['weight_data']
         
@@ -143,10 +153,24 @@ class PINNTrainer:
             # Pesos fixos com curriculum learning
             total_loss = self.config['weight_data'] * loss_data + weight_pde_curr * loss_pde_total
 
-        return total_loss, loss_data, loss_pde_total, outputs
+        return total_loss, loss_data, loss_pde_total, loss_bc, loss_reg, outputs
 
     def train(self):
         logger.info(f"Iniciando Treinamento Híbrido no dispositivo: {self.device}")
+        
+        # ==========================================================
+        # CALLBACK: VALIDAÇÃO DE NORMALIZAÇÃO PRÉ-TREINO
+        # ==========================================================
+        try:
+            validate_normalization(
+                train_loader=self.train_loader,
+                data_stats=self.data_stats,
+                raise_on_critical=True,
+            )
+        except ValueError as e:
+            logger.error(f"Treinamento ABORTADO por falha na validação de normalização:\n{e}")
+            raise
+        
         total_start_time = time.time()
         global_epoch = 0
         
@@ -184,8 +208,12 @@ class PINNTrainer:
                 train_loss_acc = 0
                 data_loss_acc = 0
                 pde_loss_acc = 0
+                bc_loss_acc = 0
+                reg_loss_acc = 0
+                # Acumuladores Heston
+                nu_acc = theta_acc = kappa_acc = xi_acc = rho_acc = 0.0
                 
-                # Acumuladores para métricas
+                # Acumuladores para métricas de preço/vol
                 pred_vol_acc = 0
                 pred_price_acc = 0
                 real_price_acc = 0
@@ -195,7 +223,7 @@ class PINNTrainer:
                 for batch in self.train_loader:
                     self.optimizer.zero_grad()
                     
-                    loss, l_data, l_pde, outputs = self.compute_loss(batch, w_pde)
+                    loss, l_data, l_pde, l_bc, l_reg, outputs = self.compute_loss(batch, w_pde)
                     
                     if torch.isnan(loss) or torch.isinf(loss) or l_pde > 1e6:
                         # Pula batch corrompido
@@ -211,14 +239,21 @@ class PINNTrainer:
                     train_loss_acc += loss.item()
                     data_loss_acc += l_data.item()
                     pde_loss_acc += l_pde.item()
+                    bc_loss_acc += l_bc.item()
+                    reg_loss_acc += l_reg.item()
                     
                     # Coleta métricas
                     if 'heston_params' in outputs and outputs['heston_params'] is not None:
-                        nu = outputs['heston_params'][0]
-                        # Monitorar volatilidade média (raiz da variância nu)
+                        nu, theta, kappa, xi, rho = outputs['heston_params']
                         pred_vol = torch.sqrt(torch.clamp(nu, min=1e-6)).mean().item()
+                        # Acumula parâmetros Heston médios do batch
+                        nu_acc    += nu.mean().item()
+                        theta_acc += theta.mean().item()
+                        kappa_acc += kappa.mean().item()
+                        xi_acc    += xi.mean().item()
+                        rho_acc   += rho.mean().item()
                     else:
-                        pred_vol = 0.0  
+                        pred_vol = 0.0
                     
                     # Médias de preço para diagnóstico de viés
                     pred_price_norm = outputs['price']
@@ -246,6 +281,8 @@ class PINNTrainer:
                 avg_total = train_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
                 avg_data = data_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
                 avg_pde = pde_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
+                avg_bc = bc_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
+                avg_reg = reg_loss_acc / len(self.train_loader) if len(self.train_loader) > 0 else 0
 
                 # Validação
                 val_mse, val_mae = self.validate()
@@ -262,12 +299,22 @@ class PINNTrainer:
                 self.history['weight_pde_curr'].append(w_pde)
                 self.history['loss_data'].append(avg_data)
                 self.history['loss_pde'].append(avg_pde)
+                self.history['loss_bc'].append(avg_bc)
+                self.history['loss_reg'].append(avg_reg)
                 self.history['lr'].append(lr)
                 self.history['avg_pred_vol'].append(avg_pred_vol)
                 self.history['avg_pred_price'].append(avg_pred_price)
                 self.history['avg_real_price'].append(avg_real_price)
                 self.history['val_mae'].append(val_mae)
                 self.history['bias_pred'].append(diff_pred)
+                
+                # Parâmetros Heston médios da época
+                n_batches = len(self.train_loader) if len(self.train_loader) > 0 else 1
+                self.history['avg_nu'].append(nu_acc / n_batches)
+                self.history['avg_theta'].append(theta_acc / n_batches)
+                self.history['avg_kappa'].append(kappa_acc / n_batches)
+                self.history['avg_xi'].append(xi_acc / n_batches)
+                self.history['avg_rho'].append(rho_acc / n_batches)
                 
                 # Razão PDE/Data
                 pde_data_ratio = avg_pde / avg_data if avg_data > 0 else 0
@@ -287,9 +334,9 @@ class PINNTrainer:
                 self.history['moneyness_preservation'].append(self.data_stats.get('moneyness_mean', 0.0))
                 
                 pbar.set_postfix({
-                    'L_Tot': f"{avg_total:.4f}",
-                    'L_Dat': f"{avg_data:.4e}",
-                    'L_PDE': f"{avg_pde:.4e}",
+                    'Loss': f"{avg_total:.4f}",
+                    'Data': f"{avg_data:.4f}",
+                    'PDE': f"{avg_pde:.2f}",
                     'MAE': f"{val_mae:.2f}", 
                     'Bias': f"{diff_pred:+.2f}"
                 })
@@ -304,9 +351,30 @@ class PINNTrainer:
                     
                     if val_mse < self.best_val_loss:
                         self.best_val_loss = val_mse
-                        os.makedirs(PATHS.get('model_save_dir', 'resultados'), exist_ok=True)
-                        torch.save(self.model.state_dict(), 
-                                 os.path.join(PATHS.get('model_save_dir', 'resultados'), 'best_model_weights.pth'))
+                        save_dir = PATHS.get('model_save_dir', 'resultados')
+                        os.makedirs(save_dir, exist_ok=True)
+                        save_path = os.path.join(save_dir, 'best_model_weights.pth')
+                        
+                        # Salvamento robusto para Windows (evita ERROR_USER_MAPPED_FILE 1224)
+                        try:
+                            tmp_path = save_path + ".tmp"
+                            torch.save(self.model.state_dict(), tmp_path)
+                            # os.replace é mais atômico e lida melhor com substituição no Windows
+                            if os.path.exists(tmp_path):
+                                if os.path.exists(save_path):
+                                    try: os.remove(save_path)
+                                    except: pass
+                                os.replace(tmp_path, save_path)
+                                logger.info(f"💾 Melhor modelo salvo: {val_mse:.6f}")
+                        except Exception as e:
+                            logger.warning(f"Erro não fatal ao salvar pesos (lock do Windows?): {e}")
+                            # Tenta salvar com nome alternativo se o principal estiver travado
+                            try:
+                                recovery_path = save_path.replace('.pth', f'_bkp_epoch_{global_epoch}.pth')
+                                torch.save(self.model.state_dict(), recovery_path)
+                                logger.info(f"💾 Modelo recuperado em: {recovery_path}")
+                            except:
+                                logger.error("Falha crítica ao salvar pesos. O treino continuará, mas o modelo não foi persistido.")
                 else:
                     epochs_no_improve += 1
 
